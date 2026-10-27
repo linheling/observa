@@ -1,0 +1,12 @@
+# Normalize line endings so the repo checks out cleanly on Windows, macOS and Linux.
+* text=auto eol=lf
+
+# Windows launcher must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries
+*.jar binary
+*.png binary
+*.ogg binary
+*.hprof binary

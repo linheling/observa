@@ -1,0 +1,1 @@
+{"schema_version":1,"generated_at":"2026-10-25T16:38:48.608862300Z","data":{"reason":"manual","label":"example","file":"20261026-003848-manual-example.json.gz","path":"D:\\C\\MC\\test\\run\\observa\\blackbox\\20261026-003848-manual-example.json.gz","bytes":3437,"tip":"GET /observa/v1/blackbox lists every dump; unzip and read trigger/ring/snapshot"}}

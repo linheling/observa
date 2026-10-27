@@ -1,0 +1,27 @@
+# 1.21.1（NeoForge 21.1.x）必须显式声明 modLoader / loaderVersion；license 必填。
+# 花括号占位符由 build.gradle 的 processResources 在构建时展开（值来自 gradle.properties）。
+# 注意：不要在本文件里写“美元号+花括号”形式的示例文字，它会被 Groovy 模板当表达式求值导致构建失败。
+modLoader="javafml"
+loaderVersion="[1,)"
+license="${mod_license}"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+authors="${mod_authors}"
+description="${mod_description}"
+
+[[dependencies.${mod_id}]]
+modId="neoforge"
+versionRange="${neo_version_range}"
+mandatory=true
+
+[[dependencies.${mod_id}]]
+modId="minecraft"
+versionRange="${minecraft_version_range}"
+mandatory=true
+
+# 唯一一处 Mixin：数区块生成（见 mixin/ChunkGenerationMixin）。NeoForge 1.21.1 从这里加载配置。
+[[mixins]]
+    config = "observa.mixins.json"
