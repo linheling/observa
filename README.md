@@ -18,6 +18,9 @@
 | M5 | 入职说明 `brief.md` + `agent.md` + `TASK.md` 任务注入 | ✅ 已实测 |
 | M6 | 客户端隧道：把玩家与服务器的 MC 连接当传输通道（不开端口） | ✅ 已实测（真客户端） |
 | M7 | 主机侧补全：`/system` `/network` GC 明细 `/heap/histogram`、剖析行号、JFR 执行采样 | ✅ 已实测（含真客户端 + 隧道） |
+| M8 | 可靠性修复：`/logs` 容量与诚实计数、卡死时环形缓冲照常推进、自动落盘加启动宽限 | ✅ 已实测 |
+| M9 | 集成服 ESC 暂停不再误报 stall；唯一一处 Mixin 统计区块生成（`/chunks` 的 `generated_total`） | ✅ 已实测（真客户端） |
+| M11 | 内存归因：类→mod 映射（`by_mod`）、直方图差分（`/heap/histogram/compare`）、JFR 分配点/存活对象归 mod、支配树与 retained size（`/heap/retained`） | ✅ 已实测（交叉校验一致） |
 
 未实现的端点在 `/manifest` 里如实标成 `"status": "planned"`——不会假装可用。
 
@@ -103,8 +106,11 @@ Invoke-RestMethod -Headers $h http://127.0.0.1:8724/observa/v1/metrics
 | GET | `/memory` | ✅ | 堆与非堆、各内存池、各收集器与上一次 GC 的逐池回收明细、类加载 |
 | GET | `/system` | ✅ | 进程/整机 CPU、物理内存与 swap、进程 uptime/线程、游戏目录所在卷的磁盘 |
 | GET | `/network?top=10` | ✅ | 每玩家 ping（keep-alive RTT）、收发包数/字节数与每秒速率、总计 |
-| GET | `/heap/histogram?top=25` | ✅ | 最近一次堆直方图：存活实例数与估算浅尺寸、按类与按包聚合（没有就回 `state:"idle"`） |
-| POST | `/heap/histogram/start` | ✅ | 异步触发一次 dump+解析：`{"live":true,"keep_file":false,"top":25}`，已有一份在跑时回 409 |
+| GET | `/heap/histogram` | ✅ | 最近一次堆直方图：存活实例数与估算浅尺寸、按类/按包/**按 mod** 聚合，附类→mod 映射来源与 `recent_histograms`（没有就回 `state:"idle"`；条数在 `/heap/histogram/start` 里用 `top` 指定） |
+| POST | `/heap/histogram/start` | ✅ | 异步触发一次 dump+解析：`{"live":true,"keep_file":false,"top":25}`，已有一份在跑（或 retained 正在跑）时回 409；结果保留最近 5 份供差分 |
+| GET | `/heap/histogram/compare?from=&to=&top=20` | ✅ | 两次直方图的差分：哪些类、哪个 mod 在涨（`delta_bytes`）；缺省比最近两份，历史不足或同一次运行回 400 |
+| GET | `/heap/retained` | ✅ | 最近一次支配树分析：每类 **retained size**（独占字节，各类互不重叠）、`dominated_by_class`（谁持有），按 mod 汇总（没有就回 `state:"idle"`） |
+| POST | `/heap/retained/start` | ✅ | 异步触发一次 dump + 引用图 + 支配树：`{"live":true}`；同时只跑一份（已在跑或直方图正在 dump 时回 409），`.hprof` 用完即删 |
 | GET | `/chunks` | ✅ | 已加载区块数 + `generated_total`/`generated_per_s`（新生成，不含磁盘读回） |
 | GET | `/snapshot` | ✅ | 以上全量合一（一次请求拿全貌，省往返） |
 | GET | `/logs?since=60&level=ERROR&limit=20` | ✅ | 跟随 `logs/latest.log`，按签名去重的 WARN/ERROR/FATAL 与计数（INFO 不保留，`level=INFO` 回 400） |
@@ -208,9 +214,50 @@ curl -s -H "$H" $API/heap/histogram                          # 轮询：state=ru
 - **成本**：`live:true` 会触发一次 full GC + dump，实测 350 MB 堆 `dump_ms=392`、`parse_ms=575`。dump 期间是 STW（约 0.4 秒），所以别在玩家投诉卡顿的**那一刻**去点它。
 - **默认不保留文件**（`keep_file:false`）：解析完就删 `.hprof`，`config/observa/heap/` 最多留 3 份（设 `keep_file:true` 时会留）。这个文件等于一次完整内存快照，和 `.jfr` 不同，它对磁盘很重（本机 350 MB/次）。
 - **浅尺寸是估算**，但按运行时真实引用宽度折算（压缩指针 4 B 引用 / 12 B 头），与 `jcmd GC.class_histogram` 的同类字节数差 1–2%：实测 `byte[]` 54,782,440 vs 54,864,432、`Object[]` 17,917,608 vs 17,926,536、`HashMap$Node` 7,775,456 vs 7,780,192。实例数是逐类精确的（15/15 类名一致、14 项完全相等，最大差 1）。
-- 这不是 **retained size**（不含被引用对象），所以「谁占得多」看它，「删掉这个能不能救内存」还得看支配树（本模组不做）。
+- 这不是 **retained size**（不含被引用对象），所以「谁占得多」看它，「删掉这个能不能救内存」得看 `/heap/retained` 的支配树（见下一节）。
 - `skipped_records`：解析时跳过的非堆记录（栈帧/栈轨迹等记账项），几十到几百条都正常，不影响实例统计。
 - 与 `jcmd` 的两个已知口径差：`java.lang.Class` 在 HPROF 里用 `CLASS_DUMP` 描述，不会写成 2 万多条 `INSTANCE_DUMP`；JVM 内部 filler 数组在 HPROF 里被编码成 `int[]`。
+
+#### 按 mod 归因（`by_mod`）
+
+同一个响应里每个类行带 `mod_id`，顶层 `by_mod[]` 汇总到 mod，`mod_mapping` 说明这份映射是怎么建的。
+
+- **映射来源**：启动后第一次用到时扫 `<gameDir>/mods/*.jar`，读 jar 里 `META-INF/neoforge.mods.toml`（或 `mods.toml`）的 `modId`/`displayName`，只索引**包名**而不是每个类名（省内存；两个 mod 撞同一包时保留先到者并计入 `mod_mapping.package_conflicts`）。
+- **兜底规则**：`net.minecraft.`/`com.mojang.` → `minecraft`，`net.neoforged.`/`cpw.mods.`/`net.minecraftforge.` → `neoforge`，`java.`/`javax.`/`jdk.`/`sun.`/`com.sun.` → `jdk`，常见第三方库 → `library`，其余 `unknown`。
+- **盲区**：`mods/` 里没有的代码一律归 `unknown`。开发环境（`runServer`）的 `mods/` 是空的，所以 `mod_mapping.mods_indexed` 会是 0 —— 这时 `by_mod` 只剩下前缀兜底的那几个桶（`minecraft`/`neoforge`/`jdk`/`library`/`unknown`），别拿它做 mod 归因。
+- **归因的是「类属于谁」，不是「谁分配的」**：模组服务器里吃内存的对象大多是 vanilla/库类（`CompoundTag`、`ItemStack`、`PalettedContainer`、`fastutil`、Netty）。问「谁在 new」要看 JFR 报告的 `allocations.top_sites[].site_mod_id`。
+
+#### 什么在涨：`/heap/histogram/compare`
+
+```
+GET /heap/histogram/compare?top=20                  # 比最近两份
+GET /heap/histogram/compare?from=hist-1&to=hist-2   # 指定 id（GET /heap/histogram 的 recent_histograms）
+```
+
+返回 `delta{total_shallow_bytes,total_instances,class_count}`、`classes[]`（含 `delta_instances`/`delta_bytes`/`mod_id`）与 `mods[]`（含 `delta_bytes`/`delta_instances`），按 `delta_bytes` **降序**（涨得最多的排最前，负值在尾部）取 `top`。
+
+- 内存里保留最近 5 份结果（`recent_histograms`），比 dump 出来的 `.hprof` 便宜得多；超过 5 份丢最旧的一份。
+- `mods[]` 是全量汇总；`classes[]` 只能取到两次快照各自保留的类明细（每份最多 3000 行，见 `/heap/histogram` 的 `classes`），所以规模极大的整合包里，类级 delta 可能漏掉长尾类——看 `mods[]` 更稳。
+- 两次 dump 之间只要发生过 GC 就会抖动，看符号和量级，别逐字节当真；两次间隔太短（或指定的 id 不存在 / 同一次运行）回 400 `not_enough_history`。
+
+### `/heap/retained`（支配树 / retained size）
+
+直方图回答「谁占着字节」，回答不了「删掉谁就掉多少内存」。后者需要**引用图**：谁指向谁，然后从 GC root 做支配树，某对象的 retained size = 删掉它之后能释放的字节数。
+
+```bash
+curl -s -X POST -H "$H" -H 'Content-Type: application/json' -d '{"live":true}' $API/heap/retained/start   # 202，异步
+curl -s -H "$H" $API/heap/retained                     # 轮询：state=running|done|failed|idle
+```
+
+响应关键字段：`total_retained_bytes`（可达堆）、`classes[]`（`class`/`mod_id`/`retained_bytes`/`pct`/`instances_counted`/`dominated_by_class`/`dominated_by_mod_id`）、`by_mod[]`、`objects`/`edges`/`roots`/`layout_mismatches`/`dropped_edges`/`unreachable_pct`/`classes_truncated`/`cross_check`。
+
+- **成本**：一次 `live:true` = 一次 full GC（STW ~0.4 s）+ dump + 两趟扫描 + 支配树。实测 4.1 M 对象 / 190 MB dump：`dump_ms=426`、**`analyze_ms=7183`**（分析跑在 `observa-retained` 线程，不卡 tick，但吃一个核）。
+- **各类 retained 互不重叠，相加 ≈ 整堆**：按支配树做「分区」——一旦某个对象被计入某类，它的子树不再给别的类重复累加。所以 `sum(classes[].retained_bytes)` 在 `classes_truncated:false` 时**精确等于** `total_retained_bytes`（实测 `delta=0`），可以直接比大小；`classes_truncated:true` 说明只报了前 60 类，别直接求和。
+- 响应里的 `classes[].retained_bytes` 是「这一类的对象消失后能释放的字节」（支配子树），与直方图的浅尺寸不是一回事；`dominated_by_class` 是「这些字节被谁持有」，`instances_counted` 是**被计入该类的对象数**（支配分区里最上层的那些，不是实例总数）。
+- **`dropped_edges` 非 0 是正常的**：dump 里有一批对象只有类元数据、没有实例记录（`Class` 镜像等），指向它们的引用被压掉、不参与建图（实测 1.13 M 条）。它只是「这份 dump 有多不完整」的指标。
+- **`unreachable_pct` 大不代表分析错了**：`live:false` 不保证 dump 前做过 full GC，垃圾会进快照（实测这次 61% 是垃圾：JVM 打了 `GC locker is held; pre-heapdump GC was skipped`）。retained/可达统计只算可达集，所以数字不受影响；把 `unreachable_pct` 当成「这份 dump 有多脏」的指标。
+- **对象上限**：默认按堆的 40% 预算（每对象 160 B）自动算，`limit` 见 `/manifest` 的 `heap_retained_effective_object_limit`；超了回 `state:"failed"` 并提示抬 `-Xmx` 或改用 `/heap/histogram`。
+- **`.hprof` 不留原件**（和直方图的 `keep_file` 不同）：解析完即删，会吃掉一次完整堆快照的磁盘。要留原件用 `/heap/histogram/start` 的 `keep_file:true`。
 
 ### `/chunks` 的生成速率（M9）
 
@@ -406,8 +453,8 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8724/observa/v1/healt
 
 | 支持 | 不支持（回 501/404 并说明原因） |
 |---|---|
-| `/health` `/metrics` `/entities` `/memory` `/chunks` `/snapshot` `/system` `/network` `/heap/histogram` | `/profiler/report/{id}` — 报告可能超过单包且需要落盘路径，请到服务器本机取 |
-| `/logs` `/blackbox` `/dump` `/profiler/status` `/brief` `/brief.md` `/heap/histogram/start` | `/profiler/start` `/profiler/stop` — 不在玩家机器上远程启停录制（避免远程把服务器磁盘写满） |
+| `/health` `/metrics` `/entities` `/memory` `/chunks` `/snapshot` `/system` `/network` `/heap/histogram` `/heap/histogram/compare` `/heap/retained` | `/profiler/report/{id}` — 报告可能超过单包且需要落盘路径，请到服务器本机取 |
+| `/logs` `/blackbox` `/dump` `/profiler/status` `/brief` `/brief.md` `/heap/histogram/start` `/heap/retained/start` | `/profiler/start` `/profiler/stop` — 不在玩家机器上远程启停录制或触发堆 dump（那是 STW，且会把服务器磁盘写满） |
 | `/manifest`（精简版：只列隧道支持项） | — |
 
 ### 实现要点（为什么这样设计）
@@ -485,10 +532,16 @@ python scripts/rcon.py 'summon minecraft:zombie ~ ~ ~' 'list'
 - **区块生成计数（M9）**：`forceload` 64 个新区块后 `generated_total=81`、`generated_per_s=3.24`、`loaded` 841→1570；同一区域重载后 `generated_total` 不涨——磁盘读回不算生成
 - **ESC 暂停不误报（M9，真客户端）**：单机进存档（集成服 8725）按 ESC → `/health` 立即 `paused:true`，停 87 秒（grace 已过期）期间 `stall_dumps=0`、`suppressed_by_pause=1`，没有落盘；再按 ESC 恢复后 `paused:false`；此时用 `/selftest/stall` 真卡 6 秒 → 正常落 `20261027-000224-stall-5s.json.gz`
 - **暂停状态可见性（M9）**：ESC 期间 `/metrics` 带 `paused:true` 和一条解释 note；`/blackbox` 的 `stats` 有 `paused`、`suppressed_by_pause`、`pause_forced`
+- **堆直方图按 mod 归因（M11）**：`/heap/histogram` 的 `by_mod[]` 与每行的 `mod_id`、`/heap/histogram/compare` 的 `mods[].delta_bytes`；映射来自 `mods/*.jar` 里的 `neoforge.mods.toml`（`mod_mapping` 报告索引了多少 mod/包）
+- **retained size / 支配树（M11）**：190 MB dump（4,146,765 对象、8,299,351 条引用、24,526 类、35,331 个 GC root）→ `dump_ms=412`、`analyze_ms=6385`、`layout_mismatches=0`、`dropped_edges=1,128,353`（指向 `Class` 镜像等「只有元数据没有实例记录」的对象，被压掉）；retained 73,055,040 B（可达集），`unreachable` 3,116,631 对象 / 116,778,288 B（这份 dump 跳过了 pre-dump GC，垃圾占 61%，retained 数字不受影响）
+- **两条自检同时成立（M11）**：同一次 dump 上直方图与对象图的**对象数/浅字节逐字节一致**（`delta objects=0 bytes=0`，两条独立读取路径互为校验）；各类 retained 相加**精确等于**可达堆（`sum(retained)=73055040 total=73055040 delta=0`，验证「支配分区」语义）
+- **继承字段的浅尺寸修正（M11）**：`HeapHistogram` 原先把 `instanceSize` 当成本类字段和、只减本类引用字段，深继承类每个引用字段多算 4 B（整堆差 5.6%）；改按父链累加引用字段后与对象图一致
 
 ## 已知边界
 
-- `/heap/histogram` 是**快照**不是时间序列：要看「是不是泄漏」得隔一段时间手动触发两次，比较同一类的实例数
+- `/heap/histogram` 是**快照**不是时间序列：要看「是不是泄漏」得隔一段时间手动触发两次，再用 `/heap/histogram/compare` 比（内存里保留最近 5 份）
+- `by_mod` 只认 `mods/` 里的 jar：开发环境 `runServer` 的 `mods/` 为空，归因只剩前缀兜底的桶（`minecraft`/`neoforge`/`jdk`/`library`/`unknown`）；要测归因得跑真实整合包
+- `/heap/retained` 是**当前实现的能力上限**：它给 retained size 与 `dominated_by_class`，但**不给引用链**（`A → B → C` 的完整路径），所以「为什么它还没被回收」要靠类名+`dominated_by_class` 推断。支配树按 HPROF 显式 GC root 建（`ROOT_*` 记录 + 类静态字段），不用「入度 0 即根」的近似——后者会把软/弱引用对象算成根、retained 虚高
 - `live:true` 的 dump 会在 JVM 里触发一次 full GC 并 STW 约 0.4 秒（350 MB 堆实测）；`keep_file:false` 时 `.hprof` 解析完即删
 - 浅尺寸是估算（引用宽度按 VM 选项折算、8 B 对齐），不是 retained size；`skipped_records` 是非堆记账记录，可忽略
 - 隧道只在你已连接、且权限达标时可用；断线后客户端端点回 503 `no_tunnel`，`.jfr` 原件不通过隧道传

@@ -44,7 +44,7 @@ curl -s -H "$H" $BASE/snapshot    # 一次拿全貌
 | 1a 持续高（avg 与 p99 都 > 45ms） | `GET /entities?by=type&top=10` | `total` 暴涨 / `item_entities` 上万 / 某类型独占 | 实体堆积；按类型定位是刷怪塔、掉落物还是插件刷的 |
 | 1b 尖峰（p99 ≫ avg，avg 正常） | `GET /profiler/start`（M2） | 定期 GC、周期任务、区块加载 | 抓 30s 采样看热点方法 |
 | 偶发瞬卡，TPS 看着正常 | `/metrics?window=1` | `tps.1s` 掉但 `1m` 正常 = 刚发生 | 立刻 `/snapshot` 留存；开黑匣子回溯（M4） |
-| 内存涨 / 疑似泄漏 | `GET /memory` | `heap_used_pct` 持续爬、`gc_pause_total_ms` 涨但 `heap_used` 不回落 | JFR 录制（M3）看对象分配与存活 |
+| 内存涨 / 疑似泄漏 | `GET /memory` | `heap_used_pct` 持续爬、`gc_pause_total_ms` 涨但 `heap_used` 不回落 | `/heap/histogram` 看 `by_mod` → 隔 10 分钟两次 → `/heap/histogram/compare` 看 delta → `/heap/retained` 看谁能救（§13.1） |
 | 区块相关卡顿 | `GET /chunks` + `/entities?by=chunk&top=5` | `loaded` 异常高；单区块实体数惊人 | 查加载器（chunkloader / 传送门 / 视距） |
 | 玩家掉线、网络差 | `GET /network`（M2） | 包速率、玩家延迟 | — |
 | 崩服 / 异常刷屏 | `GET /logs?since=300&level=ERROR`（M4）+ `GET /blackbox` | 去重后的错误计数与首次出现时间 | 拿黑匣子里的环形缓冲回放卡顿前 5 分钟 |
@@ -258,9 +258,36 @@ curl -s -H "$H" $BASE/heap/histogram        # state: running -> done
 - **判泄漏**：隔 10 分钟抓两次，看同一类（比如某个 mod 的 `ChunkCache$Entry`）实例数是否单调涨。
 - `live:true` 会触发一次 full GC + 停顿（350 MB 堆实测约 0.4 秒），别在玩家投诉卡顿的当下点。
 - 浅尺寸是估算（按压缩指针折算、8 B 对齐，与 `jcmd` 差 1–2%），也**不是 retained size**：
-  它回答「这类对象本身占多少」，不回答「删掉它能不能救内存」。
+  它回答「这类对象本身占多少」，不回答「删掉它能不能救内存」——后者用 `/heap/retained`（§13.1）。
 - `skipped_records` 是非堆记账记录（栈帧/栈轨迹），几十到几百条都正常。
 - 需要精确数字时，拿 `keep_file:true` 留下的 `.hprof` 用 JDK 自带 `jcmd`/MAT 复核。
+
+### 13.1 哪个 mod 占着、什么在涨、删掉谁能救（按这个顺序问）
+
+```bash
+# 1) 哪个 mod：同一份直方图里就有 by_mod[]，每个类行还带 mod_id
+curl -s -H "$H" "$BASE/heap/histogram?top=25" | jq '.data.by_mod[0:5], .data.mod_mapping'
+
+# 2) 什么在涨：隔几分钟各抓一次（结果保留最近 5 份），再比
+curl -s -X POST -H "$H" -d '{"live":true}' $BASE/heap/histogram/start
+curl -s -H "$H" "$BASE/heap/histogram/compare?top=20" | jq '.data.mods[0:5], .data.classes[0:5]'
+
+# 3) 删掉它能救多少：建引用图 + 支配树（比直方图贵，几分钟一次就够）
+curl -s -X POST -H "$H" -d '{"live":true}' $BASE/heap/retained/start
+curl -s -H "$H" $BASE/heap/retained | jq '.data.total_retained_bytes, .data.classes[0:5]'
+```
+
+- `by_mod` 是「类属于谁」，不是「谁 new 的」：模组服务器里吃内存的常是 vanilla/库类
+  （`CompoundTag`/`ItemStack`/`PalettedContainer`/`fastutil`/Netty）。问「谁在 new」看 JFR 的
+  `allocations.top_sites[].site_mod_id`，问「谁持有」看 `/heap/retained` 的 `dominated_by_class`。
+- `mod_mapping.mods_indexed: 0` 说明这次归因完全不可用（开发环境 `mods/` 是空的）。
+- `/heap/retained` 的 `classes[].retained_bytes` 是「删掉这类对象能释放多少」，按支配树分区、
+  互不重叠，相加 ≈ `total_retained_bytes`；`instances_counted` 是被计入的最上层对象数，不是实例总数。
+- `unreachable_pct` 高只是这份 dump 里混了垃圾（JVM 可能跳过 pre-dump GC），retained 只算可达集，
+  数字不受影响；把它当「这份 dump 有多脏」看。
+- 三者的成本不同：`/heap/histogram` 秒级，`/heap/histogram/compare` 免 dump，`/heap/retained`
+  要多花几秒建图（4.1 M 对象实测 7.2 s 分析 + 一次 STW dump）。**先看 by_mod，再比 delta，
+  最后才上 retained**——前两步便宜得多。
 
 ## 14. 行号级热点（剖析 `lines[]` / JFR `execution_samples`）
 

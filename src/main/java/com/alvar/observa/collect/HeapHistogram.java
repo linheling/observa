@@ -73,6 +73,7 @@ public final class HeapHistogram {
      * @param totalShallowBytes  所有类（含数组）的浅尺寸合计（估算值，口径见类注释）
      * @param classCount         直方图中出现过的类数量（至少有一个实例的类）
      * @param top                按浅尺寸降序的前 N 个类
+     * @param all                全部类，同样按浅尺寸降序；供按 mod 归聚合与跨次 diff 使用
      * @param topPackages        按浅尺寸降序的前 20 个包
      * @param fileBytes          dump 文件字节数
      * @param parseMs            解析耗时（毫秒）
@@ -80,7 +81,7 @@ public final class HeapHistogram {
      */
     public record Result(
             long totalInstances, long totalShallowBytes, int classCount,
-            List<Entry> top, List<PackageEntry> topPackages,
+            List<Entry> top, List<Entry> all, List<PackageEntry> topPackages,
             long fileBytes, long parseMs, int skippedRecords) {
     }
 
@@ -95,11 +96,10 @@ public final class HeapHistogram {
     private static final int TAG_HEAP_DUMP_SEGMENT = 0x1C;
 
     // ---- 堆转储子记录 tag ----
-    // 注意：HotSpot 实际写入的 GC root 编号与「便携版 HPROF 规范」的表格不同！
-    // 这里用的是 JDK 21 的真实编号（可在 $JAVA_HOME/lib/src.zip 的
-    // jdk.hotspot.agent/sun/jvm/hotspot/utilities/HeapHprofBinWriter.java 中核对：
-    // ROOT_UNKNOWN=0xFF、JNI_GLOBAL=0x01、……、THREAD_OBJ=0x08）。
-    // 便携版规范把 ROOT_UNKNOWN 记为 0x01、JNI_GLOBAL 记为 0x02……，按那张表解析真实 dump 一定会错位。
+    // 有两套表，别混：老的「便携版 HPROF」文档把 root 从 0x01（ROOT_UNKNOWN）依次排到 0x09；
+    // HotSpot 的 HeapHprofBinWriter 用的是下面这套（ROOT_UNKNOWN=0xFF、JNI_GLOBAL=0x01…THREAD_OBJ=0x08，
+    // 另有 0x89 INTERNED_STRING / 0x8E JNI_MONITOR / 0x8F UNREACHABLE 这几个便携版没有的）。
+    // 我们解析的是 HotSpot 产出的 dump，所以按下面这套编号；照便携版那张表解析真实 dump 一定错位。
     private static final int SUB_ROOT_UNKNOWN = 0xFF;
     private static final int SUB_ROOT_JNI_GLOBAL = 0x01;
     private static final int SUB_ROOT_JNI_LOCAL = 0x02;
@@ -127,10 +127,10 @@ public final class HeapHistogram {
      * 运行时的引用宽度：压缩指针开启时 4 B，否则 8 B。HPROF 的尺寸按 8 B 记录，需要按这个折算。
      * 这两个值在类初始化时读一次 VM 选项，运行期不会变。
      */
-    private static final int REF_BYTES = vmOptionEnabled("UseCompressedOops", true) ? 4 : 8;
+    static final int REF_BYTES = vmOptionEnabled("UseCompressedOops", true) ? 4 : 8;
 
     /** 对象头：Mark Word 8 B + Klass 指针（压缩时 4 B）。 */
-    private static final int OBJECT_HEADER = vmOptionEnabled("UseCompressedClassPointers", true) ? 12 : 16;
+    static final int OBJECT_HEADER = vmOptionEnabled("UseCompressedClassPointers", true) ? 12 : 16;
 
     /** 读 HotSpot 的 VM 选项；拿不到（非 HotSpot / 受限环境）时用 JDK 21 的默认值。 */
     private static boolean vmOptionEnabled(String name, boolean fallback) {
@@ -228,7 +228,7 @@ public final class HeapHistogram {
         List<PackageEntry> topPackages =
                 List.copyOf(packageList.subList(0, Math.min(PACKAGE_TOP_N, packageList.size())));
 
-        return new Result(totalInstances, totalShallowBytes, all.size(), top, topPackages,
+        return new Result(totalInstances, totalShallowBytes, all.size(), top, List.copyOf(all), topPackages,
                 fileBytes, parseMs, histogram.skippedRecords);
     }
 
@@ -282,7 +282,7 @@ public final class HeapHistogram {
         };
     }
 
-    private static String primitiveArrayName(int elementType) {
+    static String primitiveArrayName(int elementType) {
         return switch (elementType) {
             case 4 -> "boolean[]";
             case 5 -> "char[]";
@@ -303,8 +303,23 @@ public final class HeapHistogram {
     }
 
     /** JVM 的对象尺寸都按 8 B 对齐；不做这一步会系统性少算几个字节的填充。 */
-    private static long align8(long size) {
+    static long align8(long size) {
         return (size + 7L) & ~7L;
+    }
+
+    /**
+     * HPROF 的元素类型码 → 字节数。基本类型数组按这个算；{@code 2}（object）在
+     * {@code PRIMITIVE_ARRAY_DUMP} 里不该出现，但按引用宽度兜住更安全。
+     */
+    static int elementSizeOf(int elementType, int idSize) throws IOException {
+        return switch (elementType) {
+            case 4, 8 -> 1;     // boolean, byte
+            case 5, 9 -> 2;     // char, short
+            case 6, 10 -> 4;    // float, int
+            case 7, 11 -> 8;    // double, long
+            case 2 -> idSize;   // 理论上 PRIMITIVE_ARRAY_DUMP 不应出现 object
+            default -> throw new IOException("unknown primitive array element type: " + elementType);
+        };
     }
 
     private static void addTo(Map<String, long[]> map, String key, long instances, long bytes) {
@@ -342,6 +357,10 @@ public final class HeapHistogram {
 
         /** 每个类的实例字段里有多少个是引用类型（HPROF 的 instanceSize 把它们按 8 B 算）。 */
         private int[] instanceRefs = new int[1 << 12];
+        /** 槽位 -> 父类 classObjId（0 = 没有父类）。 */
+        private long[] superClass = new long[1 << 12];
+        /** 槽位 -> 含继承在内的引用字段数量；-1 = 还没算（只在结算时算一次）。 */
+        private int[] hierarchyRefs = new int[1 << 12];
         /** 槽位 -> INSTANCE_DUMP 个数。 */
         private long[] instanceCount = new long[1 << 12];
         /** 槽位 -> 对象数组个数。 */
@@ -360,6 +379,7 @@ public final class HeapHistogram {
 
         Histogram() {
             Arrays.fill(instanceSize, -1L);
+            Arrays.fill(hierarchyRefs, -1);
         }
 
         void read(HprofReader reader) throws IOException {
@@ -426,15 +446,18 @@ public final class HeapHistogram {
                 int tag = reader.u1();
                 switch (tag) {
                     // ---- GC roots ----
+                    // 载荷宽度按 HPROF 规范（HotSpot 的 SUB_RECORD 编号）逐条区分：只有 id 的、
+                    // id + thread serial 的、id + thread serial + depth 的，读错一个字整份 dump 就错位。
                     case SUB_ROOT_UNKNOWN, SUB_ROOT_STICKY_CLASS, SUB_ROOT_MONITOR_USED,
                             SUB_ROOT_FINALIZING, SUB_ROOT_DEBUGGER, SUB_ROOT_REFERENCE_CLEANUP,
-                            SUB_ROOT_VM_INTERNAL, SUB_ROOT_JNI_MONITOR -> reader.id();
+                            SUB_ROOT_VM_INTERNAL, SUB_ROOT_INTERNED_STRING, SUB_ROOT_UNREACHABLE ->
+                            reader.id();
                     case SUB_ROOT_JNI_GLOBAL -> {
                         reader.id();
                         reader.id();
                     }
                     case SUB_ROOT_JNI_LOCAL, SUB_ROOT_JAVA_FRAME, SUB_ROOT_THREAD_OBJ,
-                            SUB_ROOT_INTERNED_STRING, SUB_ROOT_UNREACHABLE -> {
+                            SUB_ROOT_JNI_MONITOR -> {
                         reader.id();
                         reader.u4();
                         reader.u4();
@@ -468,7 +491,7 @@ public final class HeapHistogram {
                         reader.u4();          // stack trace serial
                         long count = reader.u4();
                         int elementType = reader.u1();
-                        int elementSize = primitiveElementSize(elementType, reader.idSize());
+                        int elementSize = elementSizeOf(elementType, reader.idSize());
                         reader.skip(count * elementSize);
                         primitiveArrayCount[elementType]++;
                         primitiveArrayBytes[elementType] +=
@@ -479,7 +502,7 @@ public final class HeapHistogram {
                         reader.u4();          // stack trace serial
                         long count = reader.u4();
                         int elementType = reader.u1();
-                        int elementSize = primitiveElementSize(elementType, reader.idSize());
+                        int elementSize = elementSizeOf(elementType, reader.idSize());
                         primitiveArrayCount[elementType]++;
                         primitiveArrayBytes[elementType] +=
                                 align8(OBJECT_HEADER + 4L + count * elementSize);
@@ -516,7 +539,7 @@ public final class HeapHistogram {
         private void readClassDump(HprofReader reader) throws IOException {
             long classObj = reader.id();
             reader.u4();          // stack trace serial
-            reader.id();          // super class object id
+            long superObj = reader.id();
             reader.id();          // class loader object id
             reader.id();          // signers object id
             reader.id();          // protection domain object id
@@ -544,8 +567,37 @@ public final class HeapHistogram {
                 }
             }
             int slot = slotFor(classObj);
+            superClass[slot] = superObj;
             instanceSize[slot] = size;
             instanceRefs[slot] = refs;
+            hierarchyRefs[slot] = -1; // 父类信息可能后到，缓存一律作废
+        }
+
+        /**
+         * 含继承在内的引用字段数。
+         *
+         * <p>{@code instanceSize} 是整个继承链的字段总大小，而 {@code instanceRefs} 只数了本类自己声明的
+         * 引用字段。少减掉父类的引用字段会让每个继承来的引用多算 4 字节——在深继承的类上这就是系统性高估。</p>
+         */
+        private int hierarchyRefs(int slot) {
+            int cached = hierarchyRefs[slot];
+            if (cached >= 0) {
+                return cached;
+            }
+            int total = 0;
+            int cursor = slot;
+            int guard = 0;
+            while (cursor >= 0 && guard++ < 64) {
+                total += instanceRefs[cursor];
+                long superId = superClass[cursor];
+                if (superId == 0L) {
+                    break;
+                }
+                int superSlot = classSlots.get(superId);
+                cursor = superSlot < 0 || superSlot == cursor ? -1 : superSlot;
+            }
+            hierarchyRefs[slot] = total;
+            return total;
         }
 
         private static void skipValue(HprofReader reader, int type) throws IOException {
@@ -582,6 +634,10 @@ public final class HeapHistogram {
             instanceSize = Arrays.copyOf(instanceSize, newCapacity);
             Arrays.fill(instanceSize, oldCapacity, newCapacity, -1L);
             instanceRefs = Arrays.copyOf(instanceRefs, newCapacity);
+            superClass = Arrays.copyOf(superClass, newCapacity);
+            int oldRefCapacity = hierarchyRefs.length;
+            hierarchyRefs = Arrays.copyOf(hierarchyRefs, newCapacity);
+            Arrays.fill(hierarchyRefs, oldRefCapacity, newCapacity, -1);
         }
 
         /** 把累加器结算成「类名 -> {实例数, 浅尺寸}」；缺失映射会直接报错而不是猜。 */
@@ -601,7 +657,7 @@ public final class HeapHistogram {
                                 + " has INSTANCE_DUMP but no CLASS_DUMP (instance size unknown)");
                     }
                     // HPROF 的 size 以 8 B 引用计；换成实际引用宽度后加对象头再对齐到 8 B。
-                    long fieldBytes = size - (long) (8 - REF_BYTES) * instanceRefs[slot];
+                    long fieldBytes = size - (long) (8 - REF_BYTES) * hierarchyRefs(slot);
                     bytes += instances * align8(OBJECT_HEADER + fieldBytes);
                 }
                 String name = strings.get(classNameId[slot]);
@@ -631,24 +687,13 @@ public final class HeapHistogram {
                 default -> throw new IOException("unknown constant-pool value type: " + type);
             };
         }
-
-        private static int primitiveElementSize(int elementType, int idSize) throws IOException {
-            return switch (elementType) {
-                case 4, 8 -> 1;     // boolean, byte
-                case 5, 9 -> 2;     // char, short
-                case 6, 10 -> 4;    // float, int
-                case 7, 11 -> 8;    // double, long
-                case 2 -> idSize;   // 理论上 PRIMITIVE_ARRAY_DUMP 不应出现 object
-                default -> throw new IOException("unknown primitive array element type: " + elementType);
-            };
-        }
     }
 
     // ---------------------------------------------------------------------
     // 流式读取器：大端 u1/u2/u4/u8/id/skip，跳过区域也保持字节对齐
     // ---------------------------------------------------------------------
 
-    private static final class HprofReader implements Closeable {
+    static final class HprofReader implements Closeable {
 
         private final InputStream in;
         private final byte[] buffer = new byte[BUFFER_SIZE];
@@ -785,7 +830,7 @@ public final class HeapHistogram {
     // long -> int 的开放寻址映射（避免每个实例都装箱 Long）
     // ---------------------------------------------------------------------
 
-    private static final class LongIndexMap {
+    static final class LongIndexMap {
 
         private long[] keys;
         private int[] values;
@@ -822,6 +867,24 @@ public final class HeapHistogram {
                         rehash();
                     }
                     return value;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+
+        /** 已有键的下标，没有则 -1（不插入）。 */
+        int get(long key) {
+            if (key == 0L) {
+                return -1;
+            }
+            int slot = spread(key) & mask;
+            while (true) {
+                long existing = keys[slot];
+                if (existing == key) {
+                    return values[slot];
+                }
+                if (existing == 0L) {
+                    return -1;
                 }
                 slot = (slot + 1) & mask;
             }

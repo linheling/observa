@@ -10,6 +10,7 @@ import com.alvar.observa.collect.NetService;
 import com.alvar.observa.collect.SystemStats;
 import com.alvar.observa.collect.MetricsService;
 import com.alvar.observa.collect.ProfilerService;
+import com.alvar.observa.collect.RetainedService;
 import com.alvar.observa.config.ObservaConfig;
 import com.alvar.observa.http.Brief;
 import com.alvar.observa.http.HttpService;
@@ -44,7 +45,8 @@ public final class TunnelServer {
 
     private static final List<String> SUPPORTED = List.of(
             "/health", "/metrics", "/entities", "/memory", "/chunks", "/snapshot",
-            "/logs", "/blackbox", "/dump", "/profiler/status", "/brief", "/brief.md");
+            "/logs", "/blackbox", "/dump", "/profiler/status", "/brief", "/brief.md",
+            "/heap/histogram", "/heap/histogram/compare", "/heap/retained");
 
     private TunnelServer() {
     }
@@ -121,35 +123,40 @@ public final class TunnelServer {
                 case "/network" -> ok(player, request.id(), NetService.json());
                 case "/heap/histogram" -> ok(player, request.id(), HeapService.instance().json());
                 case "/heap/histogram/start" -> {
-                    if (!"POST".equals(method)) {
-                        methodNotAllowed(player, request.id(), "POST");
+                    // 刻意不支持：dump 会 STW 并往服务器磁盘写，触发动作只能来自服务器本机
+                    // （和 /heap/retained/start、/profiler/start 同一条规矩）。
+                    send(player, request.id(), 501, "application/json",
+                            error("not_supported_over_tunnel",
+                                    "/heap/histogram/start triggers a full GC and a heap dump",
+                                    "run it on the server host: POST http://127.0.0.1:<port>/observa/v1/heap/histogram/start"));
+                }
+                case "/heap/histogram/compare" -> {
+                    if (!"GET".equals(method)) {
+                        methodNotAllowed(player, request.id(), "GET");
                         return;
                     }
-                    JsonObject body = new JsonObject();
-                    try {
-                        if (request.body() != null && !request.body().isBlank()) {
-                            body = JsonParser.parseString(request.body()).getAsJsonObject();
-                        }
-                    } catch (RuntimeException e) {
-                        badRequest(player, request.id(), "body must be a JSON object");
+                    String from = param(query, "from", null);
+                    String to = param(query, "to", null);
+                    int top = clamp(intParam(query, "top", 20), 1, 200);
+                    JsonObject compared = HeapService.instance().compare(from, to, top);
+                    if (compared == null) {
+                        send(player, request.id(), 400, "application/json",
+                                error("not_enough_history",
+                                        "compare needs two finished histograms that are not the same run",
+                                        "POST /observa/v1/heap/histogram/start twice then retry",
+                                        "GET /observa/v1/heap/histogram lists recent_histograms with their ids"));
                         return;
                     }
-                    boolean live = body.has("live") && body.get("live").getAsBoolean();
-                    boolean keep = body.has("keep_file") && body.get("keep_file").getAsBoolean();
-                    int top = clamp(body.has("top") ? body.get("top").getAsInt()
-                                    : ObservaConfig.TOP_N_DEFAULT.get(),
-                            1, ObservaConfig.TOP_N_MAX.get());
-                    if (!HeapService.instance().start(live, keep, top)) {
-                        send(player, request.id(), 409, "application/json",
-                                error("already_running", "a heap histogram is already being built",
-                                        "GET /observa/v1/heap/histogram to check state"));
-                        return;
-                    }
-                    JsonObject accepted = new JsonObject();
-                    accepted.addProperty("state", "running");
-                    accepted.addProperty("live", live);
-                    accepted.addProperty("keep_file", keep);
-                    send(player, request.id(), 202, "application/json", Json.stringify(Json.ok(accepted)));
+                    ok(player, request.id(), compared);
+                }
+                case "/heap/retained" -> ok(player, request.id(), RetainedService.instance().json());
+                case "/heap/retained/start" -> {
+                    // 刻意不支持：这是一次 full GC + STW dump，和 /heap/histogram/start 同理，
+                    // 只能到服务器本机触发（否则等于给远程开了一个「随时 STW + 写满磁盘」的开关）。
+                    send(player, request.id(), 501, "application/json",
+                            error("not_supported_over_tunnel",
+                                    "/heap/retained/start triggers a full GC and a heap dump",
+                                    "run it on the server host: POST http://127.0.0.1:<port>/observa/v1/heap/retained/start"));
                 }
                 case "/chunks" -> withSnapshot(player, request.id(), s -> SnapshotJson.chunks(s));
                 case "/snapshot" -> withSnapshot(player, request.id(), s -> SnapshotJson.full(s));
@@ -230,7 +237,8 @@ public final class TunnelServer {
                     }
                     data.add("endpoints", endpoints);
                     data.add("not_over_tunnel", stringArray("/profiler/report/{id}", "/profiler/start", "/profiler/stop",
-                            "/profiler/stop is intentionally not exposed: recordings are triggered on the server host"));
+                            "/heap/histogram/start", "/heap/retained/start",
+                            "dump/record triggers stay on the server host: they STW and write to disk"));
                     ok(player, request.id(), data);
                 }
                 default -> {

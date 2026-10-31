@@ -27,6 +27,9 @@ Thumbs.db
 *.log
 tmp-*
 
+# DSH run evidence (smoke console logs / scenario results)
+.dsh/
+
 # Python
 __pycache__/
 *.pyc

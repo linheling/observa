@@ -10,6 +10,7 @@ import com.alvar.observa.collect.JfrService;
 import com.alvar.observa.collect.NetService;
 import com.alvar.observa.collect.PauseState;
 import com.alvar.observa.collect.ProfilerService;
+import com.alvar.observa.collect.RetainedService;
 import com.alvar.observa.collect.SystemStats;
 import com.alvar.observa.config.ObservaConfig;
 import com.google.gson.JsonArray;
@@ -168,6 +169,9 @@ public final class HttpService implements AutoCloseable {
         route("/network", new Route("GET", this::handleNetwork));
         route("/heap/histogram", new Route("GET", this::handleHeapHistogram));
         route("/heap/histogram/start", new Route("POST", this::handleHeapStart));
+        route("/heap/histogram/compare", new Route("GET", this::handleHeapCompare));
+        route("/heap/retained", new Route("GET", this::handleRetained));
+        route("/heap/retained/start", new Route("POST", this::handleRetainedStart));
         route("/chunks", new Route("GET", this::handleChunks));
         route("/snapshot", new Route("GET", this::handleSnapshot));
         route("/profiler/start", new Route("POST", this::handleProfilerStart));
@@ -402,6 +406,19 @@ public final class HttpService implements AutoCloseable {
                     "POST " + PREFIX + "/heap/histogram/start with {\"top\":20}");
             return;
         }
+        if (HeapService.instance().running()) {
+            Json.sendError(exchange, 409, "conflict", "a heap histogram is already running",
+                    "GET " + PREFIX + "/heap/histogram for progress",
+                    "wait for it to finish before starting another one (each dump stops the world briefly)");
+            return;
+        }
+        if (RetainedService.instance().running()) {
+            // 两个 dump 同时跑 = 两次 STW + 两份对象图同时驻留，峰值内存翻倍。
+            Json.sendError(exchange, 409, "conflict", "a retained-size analysis is already running",
+                    "GET " + PREFIX + "/heap/retained for progress",
+                    "only one heap dump runs at a time: both of them stop the world and keep a graph in memory");
+            return;
+        }
         if (!HeapService.instance().start(live, keepFile, topN)) {
             Json.sendError(exchange, 409, "conflict", "a heap histogram is already running",
                     "GET " + PREFIX + "/heap/histogram for progress",
@@ -413,6 +430,72 @@ public final class HttpService implements AutoCloseable {
         data.addProperty("live", live);
         data.addProperty("keep_file", keepFile);
         data.addProperty("next", "poll GET " + PREFIX + "/heap/histogram in a few seconds");
+        Json.send(exchange, 202, Json.ok(data));
+    }
+
+    /**
+     * 两份直方图的差分：回答「什么在涨」。
+     * 不传 from/to 时用最近两份（第二新作为基线），传同一个 id 回 400 —— 和自己比没有意义。
+     */
+    private void handleHeapCompare(HttpExchange exchange) throws IOException {
+        String from = queryParam(exchange, "from");
+        String to = queryParam(exchange, "to");
+        Integer top = queryInt(exchange, "top", 20, 1, 200);
+        if (top == null) {
+            Json.sendError(exchange, 400, "bad_request", "top must be an integer between 1 and 200",
+                    "GET " + PREFIX + "/heap/histogram/compare?top=20");
+            return;
+        }
+        JsonObject data = HeapService.instance().compare(from, to, top);
+        if (data == null) {
+            Json.sendError(exchange, 400, "not_enough_history",
+                    "compare needs two finished histograms that are not the same run",
+                    "POST " + PREFIX + "/heap/histogram/start twice (a few minutes apart) then retry",
+                    "GET " + PREFIX + "/heap/histogram lists recent_histograms with their ids",
+                    "each dump stops the world briefly, so do not trigger them back to back");
+            return;
+        }
+        Json.sendOk(exchange, data);
+    }
+
+    /**
+     * 最近一次 retained size（支配树）分析的状态/结果。
+     *
+     * <p>和 /heap/histogram 的区别是这一份带引用关系：它回答「删掉谁能掉多少内存、
+     * 是被谁持有的」，直方图只能回答「哪个类占多少浅字节」。</p>
+     */
+    private void handleRetained(HttpExchange exchange) throws IOException {
+        Json.sendOk(exchange, RetainedService.instance().json());
+    }
+
+    /**
+     * 触发一次 dump + 建图 + 支配树。比 /heap/histogram/start 更重（多一张对象图），
+     * 所以同样异步返回，并且会和直方图 dump 互相避让。
+     */
+    private void handleRetainedStart(HttpExchange exchange) throws IOException {
+        JsonObject body = readJsonBody(exchange);
+        if (body == null) {
+            Json.sendError(exchange, 400, "bad_request", "body must be a JSON object",
+                    "POST " + PREFIX + "/heap/retained/start with {\"live\":true}");
+            return;
+        }
+        boolean live = !body.has("live") || body.get("live").getAsBoolean();
+        if (HeapService.instance().running()) {
+            Json.sendError(exchange, 409, "conflict", "a heap histogram dump is already running",
+                    "GET " + PREFIX + "/heap/histogram for progress, retry when it is done",
+                    "two dumps at once would each stop the world for nothing");
+            return;
+        }
+        if (!RetainedService.instance().start(live)) {
+            Json.sendError(exchange, 409, "conflict", "a retained size analysis is already running",
+                    "GET " + PREFIX + "/heap/retained for progress",
+                    "wait for it to finish (it builds the whole object graph)");
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("state", "running");
+        data.addProperty("live", live);
+        data.addProperty("next", "poll GET " + PREFIX + "/heap/retained in a few seconds");
         Json.send(exchange, 202, Json.ok(data));
     }
 
@@ -779,8 +862,11 @@ public final class HttpService implements AutoCloseable {
         rows.add(new String[]{"GET", "/system", "available", "process/system CPU, physical memory, swap, disk of the game directory"});
         rows.add(new String[]{"GET", "/memory", "available", "heap, per-pool usage, per-collector counts and the last GC in detail"});
         rows.add(new String[]{"GET", "/chunks", "available", "loaded chunks plus generated_total/generated_per_s (chunk generation is counted by a Mixin on the NOISE step)"});
-        rows.add(new String[]{"GET", "/heap/histogram", "available", "last heap histogram: live instances and shallow bytes per class"});
-        rows.add(new String[]{"POST", "/heap/histogram/start", "available", "body {live, keep_file, top}; dumps the heap (brief STW) and parses it off-thread"});
+        rows.add(new String[]{"GET", "/heap/histogram", "available", "last heap histogram: shallow bytes per class, rolled up per mod (by_mod) plus the class->mod mapping stats"});
+        rows.add(new String[]{"POST", "/heap/histogram/start", "available", "body {live, keep_file, top}; dumps the heap (brief STW) and parses it off-thread; the last 5 results are kept for diffing"});
+        rows.add(new String[]{"GET", "/heap/histogram/compare?from=&to=&top=20", "available", "diff of two histograms: which classes and which mods grew (defaults to the two most recent runs)"});
+        rows.add(new String[]{"GET", "/heap/retained", "available", "last retained size analysis: per class and per mod bytes that go away if it is dropped, plus who dominates it"});
+        rows.add(new String[]{"POST", "/heap/retained/start", "available", "body {live}; dump the heap, build the object graph and run the dominator tree off-thread (heavier than a histogram)"});
         rows.add(new String[]{"GET", "/logs?since=60&level=ERROR&limit=20", "available", "deduplicated WARN/ERROR/FATAL events with counts, first/last seen and sample stack (INFO is not retained)"});
         rows.add(new String[]{"GET", "/snapshot", "available", "all of the above in one response"});
         rows.add(new String[]{"GET", "/profiler/status", "available", "current recording state and recent report ids"});
@@ -824,6 +910,10 @@ public final class HttpService implements AutoCloseable {
         limits.addProperty("logs_entries_cap", 5000);
         limits.addProperty("debug_allow_selftest", ObservaConfig.DEBUG_ALLOW_SELFTEST.get());
         limits.addProperty("chunk_gen_window_seconds", com.alvar.observa.collect.ChunkGenCounter.WINDOW_SECONDS);
+        limits.addProperty("heap_retained_max_objects", com.alvar.observa.collect.HeapGraph.MAX_OBJECTS);
+        limits.addProperty("heap_retained_effective_object_limit",
+                com.alvar.observa.collect.HeapGraph.effectiveObjectLimit());
+        limits.addProperty("heap_retained_max_edges", com.alvar.observa.collect.HeapGraph.MAX_EDGES);
         return limits;
     }
 

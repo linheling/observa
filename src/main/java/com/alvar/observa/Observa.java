@@ -3,7 +3,9 @@ package com.alvar.observa;
 import com.alvar.observa.blackbox.Blackbox;
 import com.alvar.observa.collect.JfrService;
 import com.alvar.observa.collect.MetricsService;
+import com.alvar.observa.collect.ModIndex;
 import com.alvar.observa.collect.ProfilerService;
+import com.alvar.observa.collect.RetainedService;
 import com.alvar.observa.config.ObservaConfig;
 import com.alvar.observa.http.HttpService;
 import com.alvar.observa.net.TunnelNet;
@@ -51,11 +53,36 @@ public class Observa {
         // 黑匣子心跳：tick 回调停了它还在跑，否则「卡死」正好让环形缓冲停止记录。
         Blackbox.instance().onServerStarted(System.currentTimeMillis());
         Blackbox.instance().startWatch();
+        prewarmModIndex();
+        // 自检：把 retained 分析真的跑一遍（它同时是这条链路唯一的端到端验证手段）。
+        if (ObservaConfig.DEBUG_RETAINED_ON_START.get()) {
+            LOGGER.info("[observa] retained selfcheck: starting a dump right after server start");
+            if (RetainedService.instance().start(true, true)) {
+                LOGGER.info("[observa] retained selfcheck: running (GET /heap/retained for the result)");
+            } else {
+                LOGGER.warn("[observa] retained selfcheck: an analysis was already running, skipped");
+            }
+        }
+    }
+
+    /**
+     * 预热类→mod 索引：第一次用到时会扫 {@code mods/*.jar}（整合包里几百个 jar），
+     * 放在后台线程做，免得某个 HTTP 请求（尤其是经隧道、跑在服务器线程上的那次）把它扛在 tick 里。
+     */
+    private static void prewarmModIndex() {
+        Thread t = new Thread(() -> {
+            try {
+                ModIndex.get();
+            } catch (RuntimeException e) {
+                LOGGER.warn("[observa] mod index prewarm failed: {}", e.toString());
+            }
+        }, "observa-modindex");
+        t.setDaemon(true);
+        t.start();
     }
 
     @SubscribeEvent
-    public void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {
-        // 隧道握手：告诉客户端「对面装了 Observa、你这个玩家有没有权限」。
+    public void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {        // 隧道握手：告诉客户端「对面装了 Observa、你这个玩家有没有权限」。
         if (event.getEntity() instanceof ServerPlayer player) {
             TunnelNet.sendHello(player);
         }

@@ -36,6 +36,7 @@ public final class ObservaConfig {
     public static final ModConfigSpec.IntValue TUNNEL_PERMISSION_LEVEL;
     public static final ModConfigSpec.BooleanValue PROFILER_INCLUDE_JDK_FRAMES;
     public static final ModConfigSpec.BooleanValue DEBUG_ALLOW_SELFTEST;
+    public static final ModConfigSpec.BooleanValue DEBUG_RETAINED_ON_START;
 
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
@@ -109,6 +110,10 @@ public final class ObservaConfig {
                         "唯一用途是验证「卡死时环形缓冲/自动落盘是否仍然工作」。打开它会让服务器真的卡一下，",
                         "所以默认关闭，只在自己验证黑匣子时临时开启。")
                 .define("allow_selftest", false);
+        DEBUG_RETAINED_ON_START = b.comment("服务端启动后立刻跑一次 retained size（支配树）分析，并把摘要写进日志。",
+                        "这是 /observa/v1/heap/retained 的端到端自检：它会 dump 一次堆（STW 一次）并建整张对象图，",
+                        "在开发机上约几百毫秒到几秒、额外几十到上百 MB 临时内存。只用于验证，默认关闭。")
+                .define("retained_on_start", false);
         b.pop();
 
         SPEC = b.build();

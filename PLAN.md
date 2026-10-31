@@ -212,6 +212,7 @@ com.alvar.observa
 | **M7 主机侧补全** | `/system`（CPU/物理内存/swap/磁盘）、`/memory` 的 GC 明细、`/network`（ping + 收发帧/字节与速率）、`/heap/histogram`（HPROF dump + 自研流式解析）、剖析 `lines[]` 行号级 self、JFR `jdk.ExecutionSample` 与 `allocations.top_sites` | 端点返回真实值；堆直方图实例数与 `jcmd GC.class_histogram` 逐类对齐；行号级热点与已知 fill 路径一致 | ✅ 已完成（见 §10.2；`/network` 已用真客户端验证） |
 | **M8 可靠性修复（观测工具自身）** | `/logs` 容量与诚实计数（5000 条、4MB/poll、64MB 才跳读，暴露 `entries_dropped`/`log_bytes_skipped`）；环形缓冲改「心跳推进冻结帧」，卡死时仍在记录并新增 `reason="stall"` 自动落盘；自动落盘加启动宽限（`min_server_ticks`/`grace_seconds`）与 `[debug] allow_selftest` + `POST /selftest/stall` 回归入口 | 700 条合成 ERROR 全量可见（712 retained）；6 秒停摆期间 4→8 帧 `frozen`；停摆 5 秒落 `stall` 且 `detail` 给出 `since_tick_ms`/`frozen_frames`；启动 30 秒内同样停摆不落盘（`suppressed_by_grace=1`），64 秒后落盘 | ✅ 已完成（见 §10.3） |
 | **M9 暂停判定 + 区块生成** | 集成服务器 ESC 暂停不再误报 `stall`（客户端 `Minecraft.isPaused()` 探针 + `MinecraftServer.isPaused()`，`/health.paused`、`stats.suppressed_by_pause`）；唯一一处 Mixin 统计区块生成（`ChunkStatusTasks#generateNoise`），`/chunks` 增 `generated_total`/`generated_per_s`；`/selftest/pause` 回归入口 | ESC 暂停 87 秒（grace 已过）零落盘、`suppressed_by_pause=1`；恢复后真卡 6 秒照常落 `stall`；`forceload` 64 新区块 → `generated_total=81`、`per_s=3.24`；同区重载不重复计数 | ✅ 已完成（见 §10.4） |
+| **M11 内存归因（mod 级）** | 类→mod 映射（扫 `mods/*.jar` 的 `neoforge.mods.toml`，按包名索引）→ `/heap/histogram` 的 `by_mod[]`/`mod_id`；直方图保留最近 5 份 + `/heap/histogram/compare` 差分；JFR `allocations.top_sites[].site_mod_id` 与 `summary.old_objects`（启用 `jdk.OldObjectSample`）；对象图 + CHK 支配树 + retained size（`/heap/retained`，含 `dominated_by_class`） | `by_mod` 能回答「哪个 mod 占着」；compare 能回答「什么在涨」；`/heap/retained` 的各类 retained 相加 ≈ 可达堆，且与直方图在同一次 dump 上对象数/浅字节一致 | ✅ 已完成（见 §10.5；自检 `delta objects=0 bytes=0 (ok)`） |
 | **M10（可选）** | 与 spark 共存验证、`/observa` 命令完善、Windows 路径兼容、区块 tick 成本归类 | — | ⬜ 待做 |
 
 ### 10.1 已落地的实测证据
@@ -290,6 +291,21 @@ M3 / M4 追加证据（同一台机器）：
 | ESC 暂停不误报（真客户端） | 单机进存档（集成服 8725）按 ESC → `/health.paused=true`；停 87 秒（`in_grace=false`）期间 `stall_dumps=0`、`suppressed_by_pause=1`；ESC 恢复 → `paused=false` |
 | 恢复后真卡仍落盘 | 恢复后 `POST /selftest/stall {"ms":6000}` → `20261027-000224-stall-5s.json.gz`（`since_tick_ms` 约 5.4s、`frozen_frames=8`） |
 | 强制暂停通道 | `POST /selftest/pause {"paused":true}` 在专用服上同样压掉 `stall`（`suppressed_by_pause` 1→2），`{paused:false}` 后恢复 |
+
+### 10.5 M11 实测证据（内存归因：mod / 差分 / retained）
+
+起服用 `mc_smoke`（scenario `retained-crosscheck2`，`[debug] retained_on_start=true` 触发一次开局自检），证据目录 `.dsh/smoke/retained-crosscheck2-*/`。
+
+| 项 | 实测 |
+|---|---|
+| 类→mod 映射 | 扫 `mods/*.jar` 的 `neoforge.mods.toml`，按**包名**索引（省内存，撞包记 `package_conflicts`）；`/heap/histogram` 的 `by_mod[]` + 每行 `mod_id`。开发环境 `mods/` 为空 → `mod_mapping.mods_indexed=0`，只退化成 minecraft/library/unknown（盲区已在文档写明） |
+| 差分 | `/heap/histogram` 保留最近 5 份（`recent_histograms`）；`/heap/histogram/compare?from=&to=&top=` 给 `classes[].delta_bytes` 与 `mods[].delta_bytes`，历史不足/同一次运行 → 400 `not_enough_history` |
+| JFR 归 mod | `allocations.top[].mod_id`（类属谁）+ `top_sites[].site_mod_id`（谁在分配，能抓 vanilla 类被 mod new）；`summary.old_objects` 来自新启用的 `jdk.OldObjectSample`（字段用 `getEventType().getFields()` 动态发现，不硬编码） |
+| 对象图 / 支配树 | 190 MB dump：4,146,765 对象、8,299,351 条引用（另有 `dropped_edges=1,128,353` 指向只有元数据没有实例记录的 `Class` 镜像）、24,526 类、35,331 个 GC root；`dump_ms=412`、`analyze_ms=6385`、`layout_mismatches=0` |
+| retained | 可达集 73,055,040 B；各类按**支配分区**汇总（一旦某对象被计入，其子树不再累加），`sum(retained)=73055040` 与 `total_retained=73055040` **精确相等**（`delta=0`，自检项 `partition-check`） |
+| 交叉校验 | 同一次 dump 上直方图与对象图：`instances=4146765 shallow_bytes=189833328 \| objects=4146765 dump_bytes=189833328 \| delta objects=0 bytes=0 (ok)`——两条独立读取路径互为校验 |
+| 垃圾混入 | `unreachable` 3,115,993 对象 / 116,568,208 B（61%）；JVM 日志 `GC locker is held; pre-heapdump GC was skipped`——`live:true` 不保证 dump 前做过 full GC，但 retained/可达统计不受影响，故如实报 `unreachable_pct` 而不重试 dump |
+| 修掉的既有 bug | `HeapHistogram` 把 `instanceSize`（含继承链）当本类字段和、只减本类引用字段 → 深继承类每个引用多算 4 B（整堆差 5.6%）。改按父链累加 `hierarchyRefs()` 后与对象图逐字节一致 |
 
 ## 11. 风险与先验证项（M0 内消化）
 

@@ -6,6 +6,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import jdk.jfr.Recording;
+import jdk.jfr.ValueDescriptor;
 import jdk.jfr.consumer.RecordedClass;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordedFrame;
@@ -24,8 +25,10 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -41,16 +44,27 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>事件只开这几类（开销可控，信息量最大）：
  * <ul>
- *   <li>{@code jdk.ObjectAllocationSample}：按类聚合分配字节数（throttle 限速）</li>
+ *   <li>{@code jdk.ObjectAllocationSample}：按类聚合分配字节数（throttle 限速），并归到 mod</li>
  *   <li>{@code jdk.GarbageCollection}：GC 次数、暂停总时长、最长一次、cause 分布</li>
  *   <li>{@code jdk.JavaExceptionThrow}：按异常类聚合（带栈，够定位）</li>
  *   <li>{@code jdk.JavaMonitorEnter} / {@code jdk.ThreadPark}：锁竞争与阻塞（阈值 10ms，滤掉噪声）</li>
+ *   <li>{@code jdk.ExecutionSample}：CPU 热点（带行号），同样归到 mod</li>
+ *   <li>{@code jdk.OldObjectSample}：活过多次 GC 的对象 —— 「谁的长寿对象在攒」，这是直方图给不了的
+ *       那半个问题（直方图说现在有多少，它说这些是多久前、谁分配的）</li>
  * </ul>
+ *
+ * <h2>为什么 OldObjectSample 用动态字段而不是类型化访问器</h2>
+ * <p>这个事件由 HotSpot 的元数据定义，字段名跨 JDK 版本有过变化（{@code object} / {@code objectClass}、
+ * {@code allocationTime} 的类型也在变）。硬写字段名等于把 JDK 版本钉死，所以这里走
+ * {@link jdk.jfr.EventType#getFields()} 自己发现字段：类名字段认 {@code java.lang.Class} 类型的，
+ * 字节数字段认名字里带 {@code heap}/{@code size} 的。发现不到的字段不影响其它事件，缺失的量给 0。</p>
  */
 public final class JfrService {
 
     private static final int MAX_HISTORY = 5;
     private static final int TOP_N = 10;
+    /** 聚合键里「类」与「分配点」的分隔符；类名与帧名里都不会出现它。 */
+    private static final String SITE_SEP = " <- ";
     /** 单个录制文件上限：JFR 自己会循环覆盖，不会把磁盘吃满。 */
     private static final long MAX_FILE_BYTES = 64L * 1024 * 1024;
 
@@ -102,6 +116,8 @@ public final class JfrService {
         recording.enable("jdk.JavaExceptionThrow").withStackTrace();
         recording.enable("jdk.JavaMonitorEnter").withThreshold(Duration.ofMillis(10));
         recording.enable("jdk.ThreadPark").withThreshold(Duration.ofMillis(10));
+        // 长寿命对象：需要栈才回答得了「谁分配的」，所以必须 withStackTrace。
+        recording.enable("jdk.OldObjectSample").withStackTrace();
         recording.start();
 
         active = recording;
@@ -197,27 +213,30 @@ public final class JfrService {
     }
 
     public synchronized JsonObject report(String id) {
-        for (int i = 0; i < history.size(); i++) {
-            JfrReport report = (JfrReport) history.toArray()[i];
-            if (!report.id().equals(id)) {
-                continue;
+        JfrReport found = null;
+        for (JfrReport candidate : history) {
+            if (candidate.id().equals(id)) {
+                found = candidate;
+                break;
             }
-            if (report.summary().has("error")) {
-                // 上次解析失败：.jfr 才是事实源，取报告时再试一次。
-                try {
-                    JsonObject retry = summarize(Path.of(report.file()), report.durationMs());
-                    JfrReport refreshed = new JfrReport(report.id(), report.startedAtMs(),
-                            report.durationMs(), report.file(), report.fileBytes(), retry);
-                    history.remove(report);
-                    history.addFirst(refreshed);
-                    return reportJson(refreshed);
-                } catch (Throwable t) {
-                    // 仍然失败：把原始错误留在报告里，别把 .jfr 路径弄丢。
-                }
-            }
-            return reportJson(report);
         }
-        return null;
+        if (found == null) {
+            return null;
+        }
+        if (found.summary().has("error")) {
+            // 上次解析失败：.jfr 才是事实源，取报告时再试一次。
+            try {
+                JsonObject retry = summarize(Path.of(found.file()), found.durationMs());
+                JfrReport refreshed = new JfrReport(found.id(), found.startedAtMs(),
+                        found.durationMs(), found.file(), found.fileBytes(), retry);
+                history.remove(found);
+                history.addFirst(refreshed);
+                return reportJson(refreshed);
+            } catch (Throwable t) {
+                // 仍然失败：把原始错误留在报告里，别把 .jfr 路径弄丢。
+            }
+        }
+        return reportJson(found);
     }
 
     public synchronized JsonObject status() {
@@ -263,6 +282,10 @@ public final class JfrService {
         JsonArray notes = new JsonArray();
         notes.add("summary is aggregated from the .jfr file; raw events stay in the file for 'jfr print'");
         notes.add("allocation weights are JFR-sampled estimates, not exact byte counts");
+        notes.add("mod_id attributes a class to a mod; site_mod_id attributes the allocating frame — "
+                + "use site_mod_id to catch 'vanilla class allocated by a mod'");
+        notes.add("old_objects comes from jdk.OldObjectSample: only objects that survived young GCs are sampled "
+                + "(bytes_est is last known heap usage, not retained size)");
         data.add("notes", notes);
         return data;
     }
@@ -295,6 +318,9 @@ public final class JfrService {
         Map<String, long[]> execSelf = new HashMap<>();      // method:line -> {selfSamples}
         Map<String, long[]> execTotal = new HashMap<>();     // method:line -> {totalSamples}
         Map<String, long[]> allocSites = new HashMap<>();    // "class <- site" -> {bytes, count}
+        Map<String, long[]> oldObjects = new HashMap<>();    // "class <- site" -> {count, bytesEst}
+        Set<String> oldFields = new LinkedHashSet<>();       // 这个 JDK 的 OldObjectSample 到底有哪些字段
+        long oldSamples = 0;
         Map<String, Integer> gcCauses = new LinkedHashMap<>();
         long gcCount = 0;
         long gcPauseNanos = 0;
@@ -321,7 +347,7 @@ public final class JfrService {
                             // 分配点：谁在 new 这个类。只看栈顶游戏帧，栈顶是 JDK 帧时往下找一层。
                             String site = allocSite(event);
                             if (site != null) {
-                                long[] at = allocSites.computeIfAbsent(cls + " <- " + site, k -> new long[2]);
+                                long[] at = allocSites.computeIfAbsent(cls + SITE_SEP + site, k -> new long[2]);
                                 at[0] += weight;
                                 at[1]++;
                             }
@@ -351,6 +377,10 @@ public final class JfrService {
                             long[] slot = park.computeIfAbsent(cls, k -> new long[2]);
                             slot[0] += nanos(event.getDuration());
                             slot[1]++;
+                        }
+                        case "jdk.OldObjectSample" -> {
+                            oldSamples++;
+                            collectOldObject(event, oldObjects, oldFields);
                         }
                         default -> {
                             // 其它事件（例如 JFR 自身的元数据）不计入摘要
@@ -382,20 +412,29 @@ public final class JfrService {
                 .forEach(e -> {
                     JsonObject row = new JsonObject();
                     row.addProperty("class", e.getKey());
+                    row.addProperty("mod_id", ModIndex.get().modOfClass(e.getKey()).modId());
                     row.addProperty("bytes_est", e.getValue()[0]);
                     row.addProperty("pct", allocTotal == 0 ? 0.0 : round2(e.getValue()[0] * 100.0 / allocTotal));
                     allocTop.add(row);
                 });
         alloc.add("top", allocTop);
 
-        // 同一个类可能有很多分配点：只给类名的话 agent 无从下手，这里给到"哪一行 new 的"。
+        // 同一个类可能有很多分配点：只给类名的话 agent 无从下手，这里给到"哪一行 new 的"，
+        // 而且把类与分配点分别归到 mod —— 跨过「对象在 vanilla 类里、但由某个 mod 造」的鸿沟。
         JsonArray siteTop = new JsonArray();
         allocSites.entrySet().stream()
                 .sorted(Comparator.comparingLong((Map.Entry<String, long[]> e) -> e.getValue()[0]).reversed())
                 .limit(TOP_N)
                 .forEach(e -> {
+                    String key = e.getKey();
+                    int sep = key.indexOf(SITE_SEP);
+                    String cls = sep < 0 ? key : key.substring(0, sep);
+                    String site = sep < 0 ? null : key.substring(sep + SITE_SEP.length());
                     JsonObject row = new JsonObject();
-                    row.addProperty("site", e.getKey());
+                    row.addProperty("class", cls);
+                    row.addProperty("class_mod_id", ModIndex.get().modOfClass(cls).modId());
+                    row.addProperty("site", site == null ? null : simple(site));
+                    row.addProperty("site_mod_id", site == null ? ModIndex.UNKNOWN.modId() : modOfLocation(site));
                     row.addProperty("bytes_est", e.getValue()[0]);
                     row.addProperty("samples", e.getValue()[1]);
                     row.addProperty("pct", allocTotal == 0 ? 0.0 : round2(e.getValue()[0] * 100.0 / allocTotal));
@@ -414,7 +453,8 @@ public final class JfrService {
                 .limit(TOP_N)
                 .forEach(e -> {
                     JsonObject row = new JsonObject();
-                    row.addProperty("frame", e.getKey());
+                    row.addProperty("frame", simple(e.getKey()));
+                    row.addProperty("mod_id", modOfLocation(e.getKey()));
                     row.addProperty("self_pct", execSamples == 0 ? 0.0 : round2(e.getValue()[0] * 100.0 / execSamples));
                     row.addProperty("self_samples", e.getValue()[0]);
                     long[] total = execTotal.get(e.getKey());
@@ -423,6 +463,37 @@ public final class JfrService {
                 });
         exec.add("top", execTop);
         summary.add("execution_samples", exec);
+
+        // ---- 长寿命对象（OldObjectSample）：活过多次 GC 的对象，按「类 + 分配点」聚合
+        JsonObject old = new JsonObject();
+        old.addProperty("count", oldSamples);
+        JsonArray oldFieldNames = new JsonArray();
+        oldFields.forEach(oldFieldNames::add);
+        old.add("fields", oldFieldNames);
+        JsonArray oldTop = new JsonArray();
+        oldObjects.entrySet().stream()
+                .sorted(Comparator.comparingLong((Map.Entry<String, long[]> e) -> e.getValue()[1]).reversed())
+                .limit(TOP_N)
+                .forEach(e -> {
+                    String key = e.getKey();
+                    int sep = key.indexOf(SITE_SEP);
+                    String cls = sep < 0 ? key : key.substring(0, sep);
+                    String site = sep < 0 ? null : key.substring(sep + SITE_SEP.length());
+                    JsonObject row = new JsonObject();
+                    row.addProperty("class", cls);
+                    row.addProperty("mod_id", ModIndex.get().modOfClass(cls).modId());
+                    row.addProperty("site", site == null ? null : simple(site));
+                    row.addProperty("site_mod_id", site == null ? ModIndex.UNKNOWN.modId() : modOfLocation(site));
+                    row.addProperty("count", e.getValue()[0]);
+                    row.addProperty("bytes_est", e.getValue()[1]);
+                    oldTop.add(row);
+                });
+        old.add("top", oldTop);
+        if (oldSamples == 0) {
+            // 采样器只在 GC 时挑对象，短录制很可能一条都没有：这不是坏了。
+            old.addProperty("tip", "OldObjectSample only samples during young GCs; record longer or induce GC pressure");
+        }
+        summary.add("old_objects", old);
 
         // ---- GC
         JsonObject gc = new JsonObject();
@@ -492,8 +563,11 @@ public final class JfrService {
     }
 
     /**
-     * 把 JFR 帧写成 {@code SimpleClassName.method:line}。JDK 帧按配置剔除（和采样剖析同一个开关），
+     * 把 JFR 帧写成 {@code 全限定类名.method:line}。JDK 帧按配置剔除（和采样剖析同一个开关），
      * native 帧没有行号也没有 Java 类名，直接跳过。
+     *
+     * <p>内部保留全限定名（归因到 mod 需要包名），输出时由 {@link #simple(String)} 剥成短名——
+     * 这样「谁在分配」既能查 mod，又不给 agent 塞一屏包名。</p>
      */
     private static String location(RecordedFrame frame) {
         if (!frame.isJavaFrame()) {
@@ -507,10 +581,79 @@ public final class JfrService {
         if (!ObservaConfig.PROFILER_INCLUDE_JDK_FRAMES.get() && isJdkClass(cls)) {
             return null;
         }
-        int dot = cls.lastIndexOf(".");
-        String simple = dot >= 0 ? cls.substring(dot + 1) : cls;
         int line = frame.getLineNumber();
-        return simple + "." + method.getName() + (line > 0 ? ":" + line : "");
+        return cls + "." + method.getName() + (line > 0 ? ":" + line : "");
+    }
+
+    /** 输出用的短帧名：只留简单类名，方法名与行号原样。 */
+    private static String simple(String location) {
+        int colon = location.indexOf(':');
+        String head = colon < 0 ? location : location.substring(0, colon);
+        int dot = head.lastIndexOf('.');
+        if (dot < 0) {
+            return location;
+        }
+        String cls = head.substring(0, dot);
+        int clsDot = cls.lastIndexOf('.');
+        String simpleCls = clsDot < 0 ? cls : cls.substring(clsDot + 1);
+        return simpleCls + "." + head.substring(dot + 1) + (colon < 0 ? "" : location.substring(colon));
+    }
+
+    /** 帧 / 分配点属于哪个 mod：location 里带全限定类名，正好能查。 */
+    private static String modOfLocation(String location) {
+        if (location == null) {
+            return ModIndex.UNKNOWN.modId();
+        }
+        int colon = location.indexOf(':');
+        String head = colon < 0 ? location : location.substring(0, colon);
+        int dot = head.lastIndexOf('.');
+        if (dot < 0) {
+            return ModIndex.UNKNOWN.modId();
+        }
+        return ModIndex.get().modOfClass(head.substring(0, dot)).modId();
+    }
+
+    /**
+     * 一条 OldObjectSample。
+     *
+     * <p>字段名靠 {@link jdk.jfr.EventType#getFields()} 现场发现，不写死：类型为
+     * {@code java.lang.Class} 的字段当「对象是谁」，名字里带 heap/size 的数值字段当字节数估算
+     * （{@code lastKnownHeapUsage} 只是这个对象最后一次被看到时的堆占用，不是 retained size）。
+     * 读不出来的字段跳过——一个字段读失败不该杀掉整份录制。</p>
+     */
+    private static void collectOldObject(RecordedEvent event, Map<String, long[]> out, Set<String> fields) {
+        String cls = null;
+        long bytes = 0;
+        for (ValueDescriptor field : event.getEventType().getFields()) {
+            String name = field.getName();
+            if (fields.size() < 32) {
+                fields.add(name + ":" + field.getTypeName());
+            }
+            try {
+                if ("java.lang.Class".equals(field.getTypeName())) {
+                    if (cls == null && event.getValue(name) instanceof RecordedClass recorded) {
+                        cls = readableClassName(recorded.getName());
+                    }
+                    continue;
+                }
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (lower.contains("heap") || lower.contains("size")) {
+                    if (event.getValue(name) instanceof Number number) {
+                        bytes = Math.max(bytes, number.longValue());
+                    }
+                }
+            } catch (Throwable ignored) {
+                // 字段读不出：字段清单里已经记过它存在，这里只跳过一个数
+            }
+        }
+        if (cls == null) {
+            return;
+        }
+        String site = allocSite(event);
+        String key = site == null ? cls : cls + SITE_SEP + site;
+        long[] slot = out.computeIfAbsent(key, k -> new long[2]);
+        slot[0]++;
+        slot[1] += bytes;
     }
 
     private static boolean isJdkClass(String cls) {

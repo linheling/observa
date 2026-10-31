@@ -152,6 +152,12 @@ public final class Brief {
         rows(b, "内存/GC 有没有压力", "`GET /memory`（分池 + 各收集器上一次 GC 的逐池回收）");
         rows(b, "谁占着内存不放（存活实例）",
                 "`POST /heap/histogram/start {\"live\":true,\"top\":25}` → 轮询 `GET /heap/histogram`（有 STW，约 0.4s）");
+        rows(b, "哪个 mod 占着内存、哪些类是它的",
+                "`GET /heap/histogram` → 顶层 `by_mod[]`（按字节降序）+ 每个类行的 `mod_id`");
+        rows(b, "什么在涨（两次直方图之差）",
+                "隔几分钟各 `POST /heap/histogram/start` 一次 → `GET /heap/histogram/compare?top=20`（默认比最近两份）");
+        rows(b, "删掉谁能掉多少内存 / 谁持有它（retained size）",
+                "`POST /heap/retained/start {\"live\":true}` → 轮询 `GET /heap/retained`（`classes[].retained_bytes` + `dominated_by_class`；有 STW，分析约数秒）");
         rows(b, "CPU/物理内存/磁盘是不是瓶颈", "`GET /system`");
         rows(b, "玩家延迟、谁在刷包/吃带宽", "`GET /network?top=10`");
         rows(b, "已加载区块数 / 这片时间新生成了多少地形", "`GET /chunks`（`generated_total` 是硬计数，`generated_per_s` 是 60s 平均）");
@@ -194,6 +200,17 @@ public final class Brief {
                 + "`generated_per_s: null` 是窗口还没攒够，不是零生成。算长区间用两次 `generated_total` 相减。\n");
         b.append("- **`/network` 的 `packets` 是帧数不是逻辑包数**：一个包拆成多帧会多算，每 tick 还有 2 帧 bundle 分隔符；字节数是压缩后的载荷，按字节看带宽更可靠。\n");
         b.append("- **`/heap/histogram` 的浅尺寸是估算**（按压缩指针折算、8 B 对齐，与 `jcmd` 差 1–2%），且不是 retained size；`live:true` 会触发一次 full GC + 停顿约 0.4 秒。\n");
+        b.append("- **`by_mod` 靠 `mods/` 里的 jar 内的 `neoforge.mods.toml` 建映射**：不在 `mods/` 的代码一律归 `unknown`，"
+                + "`mod_mapping.mods_indexed: 0` 说明这次归因完全不可用（开发环境 `runServer` 的 `mods/` 就是空的）。"
+                + "`mod_id` 说的是「这个类属于谁」，`site_mod_id` 才说「这行代码是谁在分配」——查归属看后者。\n");
+        b.append("- **`/heap/histogram/compare` 比的是两次独立 dump**：中间有 GC 就会抖动，看 `mods[].delta_bytes` 的符号和量级，别逐字节当真；"
+                + "两次间隔太短会回 `not_enough_history`。\n");
+        b.append("- **`/heap/retained` 才是 retained size**（直方图只有浅尺寸）：`classes[].retained_bytes` 是「删掉这类对象能释放多少」，"
+                + "各类按支配树分区、互不重叠，相加精确等于 `total_retained_bytes`（`classes_truncated:false` 时；只报前 60 类，"
+                + "所以先看这个标志再求和）；`instances_counted` 是被计入的最上层对象数（不是实例总数），"
+                + "`dominated_by_class` 说这些字节挂在谁身上。`dropped_edges` 非 0 是正常的（指向 `Class` 镜像等只有元数据、"
+                + "没有实例记录的对象，被压掉不参与建图）。它要建引用图 + 支配树，比直方图贵（4.1M 对象约 6-7 秒分析），"
+                + "且同样有 `live:true` 的 full GC 停顿。`unreachable_pct` 高只是 dump 里混了垃圾（JVM 跳过了 pre-dump GC），retained 数字不受影响。\n");
         b.append("- **`/logs` 只保留 WARN/ERROR/FATAL**（最近 5000 条）：`level=INFO` 会回 400，INFO 请读 `logs/latest.log`。"
                 + "响应里的 `entries_dropped` / `log_bytes_skipped` 非零说明这份视图不完整。\n");
         b.append("- **`reason=\"stall\"` 的落盘才代表卡死**：`ring` 尾部连续 `frozen:true` 且 `trigger.detail.since_tick_ms` 是该次停摆时长；"
@@ -275,6 +292,12 @@ public final class Brief {
         recipes.add(recipe("who is lagging / who floods packets", "GET", "/network?top=10", "ping_ms, sent.bytes_per_s"));
         recipes.add(recipe("who holds memory (live objects)", "POST", "/heap/histogram/start",
                 "{\"live\":true,\"top\":25} then poll GET /heap/histogram (STW ~0.4s)"));
+        recipes.add(recipe("which mod holds the memory", "GET", "/heap/histogram",
+                "by_mod[] sorted by bytes; mod_mapping says how attribution was built"));
+        recipes.add(recipe("what is growing", "GET", "/heap/histogram/compare?top=20",
+                "run /heap/histogram/start twice minutes apart, then read mods[].delta_bytes"));
+        recipes.add(recipe("how much would deleting X free", "POST", "/heap/retained/start",
+                "{\"live\":true} then poll GET /heap/retained: classes[].retained_bytes, dominated_by_class"));
         recipes.add(recipe("snapshot to disk now", "POST", "/dump", "{\"label\":\"...\"}"));
         data.add("recipes", recipes);
 
