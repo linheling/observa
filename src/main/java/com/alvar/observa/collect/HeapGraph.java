@@ -73,8 +73,10 @@ public final class HeapGraph {
     private static final int SUB_HEAP_DUMP_INFO = 0xFE;
     private static final int SUB_ROOT_UNKNOWN = 0xFF;
 
-    /** 对象数绝对上限；真正生效的上限还会受堆大小约束，见 {@link #effectiveObjectLimit()}。 */
+    /** 对象数绝对上限；真正生效的上限还会受堆大小约束，见 {@link #effectiveObjectLimit(int)}。 */
     public static final int MAX_OBJECTS = 8_000_000;
+    /** {@code max_objects} 显式放宽时允许到达的硬上限（再大就必然 OOM，不如早点拒绝）。 */
+    public static final int HARD_MAX_OBJECTS = 32_000_000;
     /** 引用上限：正向 + 反向 CSR 各约 48 MB。 */
     public static final int MAX_EDGES = 24_000_000;
 
@@ -89,8 +91,66 @@ public final class HeapGraph {
      * <p>按默认 -Xmx2G 算约 500 万个对象；小堆服务器会得到更低的数字，而不是 OOM。</p>
      */
     public static int effectiveObjectLimit() {
+        return effectiveObjectLimit(0);
+    }
+
+    /**
+     * 带显式放宽的版本。
+     *
+     * <p>{@code maxObjectsOverride > 0} 时把静态上限抬到它（最多 {@link #HARD_MAX_OBJECTS}），
+     * 但「堆的 40%」这条硬约束仍然生效——超过它就不是「慢一点」，而是必然 OOM，
+     * 那种请求应该在预检阶段被拒绝，而不是在分析到一半时把服务器拖死。</p>
+     */
+    public static int effectiveObjectLimit(int maxObjectsOverride) {
         long byHeap = (long) (Runtime.getRuntime().maxMemory() * HEAP_SHARE / BYTES_PER_OBJECT_BUDGET);
-        return (int) Math.max(64_000L, Math.min(MAX_OBJECTS, byHeap));
+        int cap = MAX_OBJECTS;
+        if (maxObjectsOverride > 0) {
+            cap = Math.min(HARD_MAX_OBJECTS, maxObjectsOverride);
+        }
+        return (int) Math.max(64_000L, Math.min(cap, byHeap));
+    }
+
+    /** retained 分析大约要为每个对象花多少字节（给预检报告用）。 */
+    public static int bytesPerObject() {
+        return BYTES_PER_OBJECT_BUDGET;
+    }
+
+    /**
+     * dump 太大、连图都建不起来时抛这个：带上「数到了多少 / 上限多少 / 大概要多少堆 / 该怎么改」，
+     * 让调用方直接拼进 HTTP 错误体的 {@code next}，而不是只写一行日志。
+     */
+    public static final class TooLargeException extends IllegalStateException {
+        private final long objects;
+        private final int limit;
+        private final boolean exact;
+
+        public TooLargeException(long objects, int limit, boolean exact) {
+            super((exact ? "dump 里有 " + objects + " 个对象"
+                    : "已数到 " + objects + " 个对象（提前中止，未继续统计，实际只多不少）")
+                    + "，超过 retained 分析上限 " + limit
+                    + "（可用堆 " + Runtime.getRuntime().maxMemory() / (1024 * 1024) + " MB，每对象约 "
+                    + BYTES_PER_OBJECT_BUDGET + " B）");
+            this.objects = objects;
+            this.limit = limit;
+            this.exact = exact;
+        }
+
+        public long objects() {
+            return objects;
+        }
+
+        public int limit() {
+            return limit;
+        }
+
+        public boolean exact() {
+            return exact;
+        }
+
+        /** 按当前上限估算这次分析需要多少堆（字节）。 */
+        public long requiredBytes() {
+            return objects * BYTES_PER_OBJECT_BUDGET;
+        }
     }
 
     private static final int MAX_LAYOUT_DEPTH = 64;
@@ -142,7 +202,20 @@ public final class HeapGraph {
      * @param hprof dump 文件（调用方负责它的生命周期）
      */
     public static Result analyze(Path hprof) throws IOException {
-        Layout layout = Layout.read(hprof);
+        return analyze(hprof, 0);
+    }
+
+    /**
+     * @param maxObjects 调用方显式放宽的对象数上限；0 = 用默认（见 {@link #effectiveObjectLimit(int)}）
+     * @throws TooLargeException 第一趟数对象时就超限，此时还没有建图、没有分配大数组
+     */
+    public static Result analyze(Path hprof, int maxObjects) throws IOException {
+        int limit = effectiveObjectLimit(maxObjects);
+        Layout layout = Layout.read(hprof, limit);
+        if (layout.objectCount() > limit) {
+            // 只有 limit<=0（不检查）时才可能走到这里
+            throw new TooLargeException(layout.objectCount(), limit, true);
+        }
         Graph graph = Graph.read(hprof, layout);
         return graph.analyze(layout);
     }
@@ -264,13 +337,20 @@ public final class HeapGraph {
         private int idSize = 4;
         /** dump 里的对象条数（第一趟顺手数出来，第二趟就能按精确大小分配，不必反复扩容）。 */
         private int objectCount;
+        /** 第一趟就盯着上限：超了立刻中止，绝不先分配几十 MB 数组再拒绝。0 = 不检查。 */
+        private int objectLimit;
 
         Layout() {
             Arrays.fill(primitiveSlots, -1);
         }
 
         static Layout read(Path hprof) throws IOException {
+            return read(hprof, 0);
+        }
+
+        static Layout read(Path hprof, int objectLimit) throws IOException {
             Layout layout = new Layout();
+            layout.objectLimit = objectLimit;
             try (HeapHistogram.HprofReader reader = open(hprof)) {
                 layout.idSize = reader.idSize();
                 while (true) {
@@ -310,6 +390,14 @@ public final class HeapGraph {
             return layout;
         }
 
+        /** 数到一个对象：顺便做上限检查，超了就在这一行抛出，而不是等数组分配完。 */
+        private void countObject() {
+            objectCount++;
+            if (objectLimit > 0 && objectCount > objectLimit) {
+                throw new TooLargeException(objectCount, objectLimit, false);
+            }
+        }
+
         private void readHeap(HeapHistogram.HprofReader reader, long segmentLength) throws IOException {
             long end = reader.offset() + segmentLength;
             while (reader.offset() < end) {
@@ -327,14 +415,14 @@ public final class HeapGraph {
                     switch (sub) {
                         case SUB_CLASS_DUMP -> readClassDump(reader);
                         case SUB_INSTANCE_DUMP -> {
-                            objectCount++;
+                            countObject();
                             reader.id();
                             reader.u4();
                             reader.id();
                             reader.skip(reader.u4());
                         }
                         case SUB_OBJECT_ARRAY_DUMP -> {
-                            objectCount++;
+                            countObject();
                             reader.id();
                             reader.u4();
                             long elements = reader.u4();
@@ -342,7 +430,7 @@ public final class HeapGraph {
                             reader.skip(elements * reader.idSize());
                         }
                         case SUB_PRIMITIVE_ARRAY_DUMP -> {
-                            objectCount++;
+                            countObject();
                             reader.id();
                             reader.u4();
                             long elements = reader.u4();
@@ -350,7 +438,7 @@ public final class HeapGraph {
                             reader.skip(elements * HeapHistogram.elementSizeOf(elementType, reader.idSize()));
                         }
                         case SUB_PRIMITIVE_ARRAY_NODATA_DUMP -> {
-                            objectCount++;
+                            countObject();
                             reader.id();
                             reader.u4();
                             reader.u4();

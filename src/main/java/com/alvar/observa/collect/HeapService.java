@@ -73,7 +73,7 @@ public final class HeapService {
                       long totalInstances, long totalShallowBytes, int classCount, int skippedRecords,
                       List<HeapHistogram.Entry> top, List<HeapHistogram.PackageEntry> packages,
                       List<HeapHistogram.Entry> classes, List<ModIndex.ModTotal> mods,
-                      boolean classesTruncated) {
+                      boolean classesTruncated, GcImpact impact) {
     }
 
     private HeapService() {
@@ -95,7 +95,7 @@ public final class HeapService {
         }
         String id = "heap-" + seq.incrementAndGet();
         Job running = new Job(id, "running", System.currentTimeMillis(), 0, 0, 0, keepFile, null, null,
-                0, 0, 0, 0, List.of(), List.of(), List.of(), List.of(), false);
+                0, 0, 0, 0, List.of(), List.of(), List.of(), List.of(), false, null);
         job = running;
         worker.submit(() -> run(running, live, keepFile, topN));
         return true;
@@ -107,12 +107,15 @@ public final class HeapService {
         long dumpMs = 0;
         long parseMs = 0;
         long bytes = 0;
+        GcImpact impact = null;
         try {
             Files.createDirectories(dir);
             Files.deleteIfExists(hprof); // dumpHeap 拒绝覆盖已有文件
+            GcImpact.Snapshot before = GcImpact.snapshot();
             long t0 = System.nanoTime();
             HeapHistogram.dumpTo(hprof, live);
             dumpMs = (System.nanoTime() - t0) / 1_000_000L;
+            impact = GcImpact.measure(dumpMs, before, GcImpact.snapshot());
             bytes = Files.exists(hprof) ? Files.size(hprof) : 0;
             long t1 = System.nanoTime();
             HeapHistogram.Result result = HeapHistogram.parse(hprof, topN);
@@ -129,15 +132,17 @@ public final class HeapService {
             Job done = new Job(running.id(), "done", running.startedAtMs(), dumpMs, parseMs, bytes, keepFile,
                     hprof.toString(), null,
                     result.totalInstances(), result.totalShallowBytes(), result.classCount(), result.skippedRecords(),
-                    result.top(), result.topPackages(), classes, mods, truncated);
+                    result.top(), result.topPackages(), classes, mods, truncated, impact);
             job = done;
             remember(done);
-            Observa.LOGGER.info("[observa] heap histogram {} done: {} classes, {} instances, {} mods, dump {}ms, parse {}ms",
-                    running.id(), result.classCount(), result.totalInstances(), mods.size(), dumpMs, parseMs);
+            Observa.LOGGER.info("[observa] heap histogram {} done: {} classes, {} instances, {} mods, "
+                            + "dump {}ms, parse {}ms, {} GC(s)/{}ms during dump",
+                    running.id(), result.classCount(), result.totalInstances(), mods.size(), dumpMs, parseMs,
+                    impact.collections(), impact.pauseTotalMs());
         } catch (Throwable t) {
             Job failed = new Job(running.id(), "failed", running.startedAtMs(), dumpMs, parseMs, bytes, keepFile,
                     hprof.toString(), String.valueOf(t), 0, 0, 0, 0,
-                    List.of(), List.of(), List.of(), List.of(), false);
+                    List.of(), List.of(), List.of(), List.of(), false, impact);
             job = failed;
             Observa.LOGGER.warn("[observa] heap histogram {} failed", running.id(), t);
         } finally {
@@ -207,6 +212,11 @@ public final class HeapService {
         return current != null && current.id().equals(id) ? current : null;
     }
 
+    /** 历次 dump 记录（最新的在前），给 {@code GET /heap/dumps} 用。 */
+    public synchronized List<Job> history() {
+        return List.copyOf(history);
+    }
+
     /** 历史 id，最新在前。 */
     public synchronized List<String> recentIds() {
         List<String> ids = new ArrayList<>(history.size());
@@ -235,6 +245,10 @@ public final class HeapService {
         data.addProperty("id", j.id());
         data.addProperty("state", j.state());
         data.addProperty("started_at_ms", j.startedAtMs());
+        // running 时 impact 还没测出来；done/failed 都有真实值。
+        boolean measured = j.impact() != null
+                && ("done".equals(j.state()) || "failed".equals(j.state()));
+        data.add("impact", measured ? j.impact().json() : GcImpact.unavailable());
         if (j.dumpMs() > 0) {
             data.addProperty("dump_ms", j.dumpMs());
         }
@@ -294,6 +308,9 @@ public final class HeapService {
             if (j.classesTruncated()) {
                 notes.add("only the top " + CLASS_DETAIL_LIMIT + " classes are kept per dump for diffing; "
                         + "by_mod is computed from the full class list and is not truncated");
+            }
+            if (j.impact() != null && j.impact().note() != null) {
+                notes.add(j.impact().note());
             }
             notes.add("compare two dumps with GET " + PATH + "/compare to see what is growing");
             data.add("notes", notes);

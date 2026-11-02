@@ -157,7 +157,14 @@ public final class Brief {
         rows(b, "什么在涨（两次直方图之差）",
                 "隔几分钟各 `POST /heap/histogram/start` 一次 → `GET /heap/histogram/compare?top=20`（默认比最近两份）");
         rows(b, "删掉谁能掉多少内存 / 谁持有它（retained size）",
-                "`POST /heap/retained/start {\"live\":true}` → 轮询 `GET /heap/retained`（`classes[].retained_bytes` + `dominated_by_class`；有 STW，分析约数秒）");
+                "`POST /heap/retained/start {\"live\":true}` → 轮询 `GET /heap/retained`（`classes[].retained_bytes` + `dominated_by_class`；有 STW，分析约数秒；dump 太大时预检会回 `too_large`+`next`，不会 OOM）");
+        rows(b, "这次采集本身花了多少（值不值得再采一次）",
+                "任何 dump 的响应里的 `impact`：`pause_ms` / `gc_collections` / `full_gc_triggered`；历史见 `GET /heap/dumps`");
+        rows(b, "分配多但活得少，还是真泄漏",
+                "`GET /heap/alloc-live?top=20`（JFR 分配 vs 直方图存活，按类对齐，给 `churn`/`leak_candidate`/`mixed`）");
+        rows(b, "JVM 启动参数有没有埋雷",
+                "`GET /jvm/flags` → `checks[]`（缺 `-Xms`、`MaxMetaspaceSize`、dump/log 路径不在 gameDir 下、`-Xmx` 超物理内存 75%）");
+        rows(b, "把这次分析要的东西一次打包", "`GET /session/export`（只读，不会触发 dump）");
         rows(b, "CPU/物理内存/磁盘是不是瓶颈", "`GET /system`");
         rows(b, "玩家延迟、谁在刷包/吃带宽", "`GET /network?top=10`");
         rows(b, "已加载区块数 / 这片时间新生成了多少地形", "`GET /chunks`（`generated_total` 是硬计数，`generated_per_s` 是 60s 平均）");
@@ -298,6 +305,14 @@ public final class Brief {
                 "run /heap/histogram/start twice minutes apart, then read mods[].delta_bytes"));
         recipes.add(recipe("how much would deleting X free", "POST", "/heap/retained/start",
                 "{\"live\":true} then poll GET /heap/retained: classes[].retained_bytes, dominated_by_class"));
+        recipes.add(recipe("is this dump worth its cost", "GET", "/heap/dumps",
+                "impact.gc_collections, impact.pause_ms, impact.full_gc_triggered per run"));
+        recipes.add(recipe("allocation churn vs real leak", "GET", "/heap/alloc-live?top=20",
+                "rows[].verdict: churn | leak_candidate | mixed; needs a heap + a JFR run"));
+        recipes.add(recipe("bad JVM flags", "GET", "/jvm/flags",
+                "checks[] with id/severity/fix; ok=false means at least one warn"));
+        recipes.add(recipe("everything for one analysis", "GET", "/session/export",
+                "?include=manifest,metrics,memory,system,heap,retained,jfr (read-only)"));
         recipes.add(recipe("snapshot to disk now", "POST", "/dump", "{\"label\":\"...\"}"));
         data.add("recipes", recipes);
 
@@ -307,6 +322,10 @@ public final class Brief {
         rules.add("entity counts cover loaded chunks only");
         rules.add("profiler percentages use busy_samples as the denominator");
         rules.add("open the pause menu in single player and the integrated server stops ticking");
+        rules.add("when flags contains during_dump or during_profiler, the mspt/tps in that sample "
+                + "includes the cost of measuring; do not report it as a regression");
+        rules.add("every dump response carries impact (gc_collections, pause_ms): check it before "
+                + "asking for another dump; a rejected retained run returns too_large plus next[]");
         data.add("rules", rules);
         return data;
     }

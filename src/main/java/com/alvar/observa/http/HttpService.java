@@ -4,6 +4,8 @@ import com.alvar.observa.Observa;
 import com.alvar.observa.api.Snapshot;
 import com.alvar.observa.blackbox.Blackbox;
 import com.alvar.observa.blackbox.LogWatch;
+import com.alvar.observa.collect.AllocLive;
+import com.alvar.observa.collect.JvmFlags;
 import com.alvar.observa.collect.MetricsService;
 import com.alvar.observa.collect.HeapService;
 import com.alvar.observa.collect.JfrService;
@@ -33,6 +35,9 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Locale;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -166,14 +171,19 @@ public final class HttpService implements AutoCloseable {
         route("/entities", new Route("GET", this::handleEntities));
         route("/memory", new Route("GET", this::handleMemory));
         route("/system", new Route("GET", this::handleSystem));
+        route("/jvm/flags", new Route("GET", this::handleJvmFlags));
         route("/network", new Route("GET", this::handleNetwork));
         route("/heap/histogram", new Route("GET", this::handleHeapHistogram));
         route("/heap/histogram/start", new Route("POST", this::handleHeapStart));
         route("/heap/histogram/compare", new Route("GET", this::handleHeapCompare));
         route("/heap/retained", new Route("GET", this::handleRetained));
         route("/heap/retained/start", new Route("POST", this::handleRetainedStart));
+        route("/heap/dumps", new Route("GET", this::handleHeapDumps));
+        route("/heap/alloc-live", new Route("GET", this::handleAllocLive));
+        route("/heap/alloc-live/start", new Route("POST", this::handleAllocLiveStart));
         route("/chunks", new Route("GET", this::handleChunks));
         route("/snapshot", new Route("GET", this::handleSnapshot));
+        route("/session/export", new Route("GET", this::handleSessionExport));
         route("/profiler/start", new Route("POST", this::handleProfilerStart));
         route("/profiler/stop", new Route("POST", this::handleProfilerStop));
         route("/profiler/status", new Route("GET", this::handleProfilerStatus));
@@ -262,6 +272,11 @@ public final class HttpService implements AutoCloseable {
     }
 
     private void handleManifest(HttpExchange exchange) throws IOException {
+        Json.sendOk(exchange, manifestJson());
+    }
+
+    /** /manifest 的内容本体；/session/export 也用它，免得两处的字段慢慢跑偏。 */
+    private JsonObject manifestJson() {
         JsonObject data = new JsonObject();
 
         JsonObject mod = new JsonObject();
@@ -293,8 +308,7 @@ public final class HttpService implements AutoCloseable {
         rules.add("null means not collected yet; never assume 0");
         rules.add("top-N is computed server-side; pass top=N to change size");
         data.add("conventions", rules);
-
-        Json.sendOk(exchange, data);
+        return data;
     }
 
     private void handleHealth(HttpExchange exchange) throws IOException {
@@ -480,13 +494,29 @@ public final class HttpService implements AutoCloseable {
             return;
         }
         boolean live = !body.has("live") || body.get("live").getAsBoolean();
+        int maxObjects = 0;
+        if (body.has("max_objects")) {
+            try {
+                maxObjects = body.get("max_objects").getAsInt();
+            } catch (RuntimeException e) {
+                Json.sendError(exchange, 400, "bad_request", "max_objects must be a positive integer",
+                        "POST " + PREFIX + "/heap/retained/start with {\"max_objects\":16000000}",
+                        "it overrides the default object limit; the JVM heap still caps it at 40% of -Xmx");
+                return;
+            }
+            if (maxObjects <= 0) {
+                Json.sendError(exchange, 400, "bad_request", "max_objects must be greater than 0",
+                        "omit it to use the default limit (see object_limit in GET " + PREFIX + "/heap/retained)");
+                return;
+            }
+        }
         if (HeapService.instance().running()) {
             Json.sendError(exchange, 409, "conflict", "a heap histogram dump is already running",
                     "GET " + PREFIX + "/heap/histogram for progress, retry when it is done",
                     "two dumps at once would each stop the world for nothing");
             return;
         }
-        if (!RetainedService.instance().start(live)) {
+        if (!RetainedService.instance().start(live, false, maxObjects)) {
             Json.sendError(exchange, 409, "conflict", "a retained size analysis is already running",
                     "GET " + PREFIX + "/heap/retained for progress",
                     "wait for it to finish (it builds the whole object graph)");
@@ -495,8 +525,153 @@ public final class HttpService implements AutoCloseable {
         JsonObject data = new JsonObject();
         data.addProperty("state", "running");
         data.addProperty("live", live);
-        data.addProperty("next", "poll GET " + PREFIX + "/heap/retained in a few seconds");
+        if (maxObjects > 0) {
+            data.addProperty("max_objects", maxObjects);
+        }
+        data.addProperty("object_limit",
+                com.alvar.observa.collect.HeapGraph.effectiveObjectLimit(maxObjects));
+        data.addProperty("next", "poll GET " + PREFIX + "/heap/retained in a few seconds; if the dump is too big "
+                + "the response carries too_large plus a next[] with the exact numbers to raise");
         Json.send(exchange, 202, Json.ok(data));
+    }
+
+    /**
+     * 历次 dump 记录：每条带 dump_ms/parse_ms 和 impact（采集自身造成的 GC 次数与停顿）。
+     *
+     * <p>历史只在内存里，进程重启即清空；磁盘上的 .hprof 是另一回事，看 dir。</p>
+     */
+    private void handleHeapDumps(HttpExchange exchange) throws IOException {
+        JsonObject data = new JsonObject();
+        data.addProperty("dir", HeapService.instance().dir().toString());
+        List<HeapService.Job> jobs = HeapService.instance().history();
+        data.addProperty("count", jobs.size());
+        JsonArray arr = new JsonArray();
+        for (HeapService.Job j : jobs) {
+            JsonObject o = new JsonObject();
+            o.addProperty("id", j.id());
+            o.addProperty("state", j.state());
+            o.addProperty("started_at_ms", j.startedAtMs());
+            o.addProperty("dump_ms", j.dumpMs());
+            o.addProperty("parse_ms", j.parseMs());
+            o.addProperty("file_bytes", j.fileBytes());
+            o.addProperty("file_kept", j.fileKept());
+            o.addProperty("total_instances", j.totalInstances());
+            o.addProperty("total_shallow_bytes", j.totalShallowBytes());
+            if (j.impact() != null) {
+                o.add("impact", j.impact().brief());
+            }
+            arr.add(o);
+        }
+        data.add("dumps", arr);
+        data.addProperty("note", "history is in memory only and resets on restart; "
+                + "compare two runs with GET " + PREFIX + "/heap/histogram/compare");
+        Json.sendOk(exchange, data);
+    }
+
+    /** allocation（JFR 采样）与 liveness（直方图）按类对齐：回答「分配得多但活得少还是真泄漏」。 */
+    private void handleAllocLive(HttpExchange exchange) throws IOException {
+        // heap_id / jfr_id 是文档里的名字，heap / jfr 是短别名；都认，省得调用方记两种。
+        String heapId = firstNonNull(queryParam(exchange, "heap_id"), queryParam(exchange, "heap"));
+        String jfrId = firstNonNull(queryParam(exchange, "jfr_id"), queryParam(exchange, "jfr"));
+        Integer top = queryInt(exchange, "top", ObservaConfig.TOP_N_DEFAULT.get(), 1,
+                Math.min(200, ObservaConfig.TOP_N_MAX.get() * 2));
+        if (top == null) {
+            Json.sendError(exchange, 400, "bad_request", "top must be an integer between 1 and 200",
+                    "GET " + PREFIX + "/heap/alloc-live?top=20");
+            return;
+        }
+        Json.sendOk(exchange, AllocLive.join(heapId, jfrId, top));
+    }
+
+    /** 先 dump 堆再立刻开始一段 JFR，让两侧覆盖同一时间窗（对齐的前提）。 */
+    private void handleAllocLiveStart(HttpExchange exchange) throws IOException {
+        Integer seconds = queryInt(exchange, "seconds", ObservatoryAllocSeconds(), 1,
+                ObservaConfig.PROFILER_MAX_SECONDS.get());
+        if (seconds == null) {
+            Json.sendError(exchange, 400, "bad_request",
+                    "seconds must be an integer between 1 and " + ObservaConfig.PROFILER_MAX_SECONDS.get(),
+                    "POST " + PREFIX + "/heap/alloc-live/start?seconds=30");
+            return;
+        }
+        Json.sendOk(exchange, AllocLive.start(seconds));
+    }
+
+    /** 采集窗的默认秒数：和 JFR 端点的默认值保持一致。 */
+    private static int ObservatoryAllocSeconds() {
+        return 30;
+    }
+
+    /** 启动参数体检：静态规则，不看运行时数字（见 JvmFlags）。 */
+    private void handleJvmFlags(HttpExchange exchange) throws IOException {
+        Json.sendOk(exchange, JvmFlags.json());
+    }
+
+    /**
+     * 一次性打包一次分析需要的东西，省掉手动 curl 十几次。
+     *
+     * <p>{@code include} 逗号分隔：manifest,health,metrics,memory,system,network,chunks,entities,
+     * heap,retained,jfr。省略即全部。<b>只读</b>，不会触发新的 dump。</p>
+     */
+    private void handleSessionExport(HttpExchange exchange) throws IOException {
+        String raw = queryParam(exchange, "include");
+        Set<String> include = new LinkedHashSet<>();
+        if (raw == null || raw.isBlank()) {
+            include.addAll(List.of("manifest", "health", "metrics", "memory", "system", "network",
+                    "chunks", "entities", "heap", "retained", "jfr"));
+        } else {
+            for (String part : raw.split(",")) {
+                if (!part.isBlank()) {
+                    include.add(part.trim().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        Snapshot snapshot = requireSnapshot(exchange);
+        if (snapshot == null) {
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("include", String.join(",", include));
+        data.addProperty("note", "read-only bundle: nothing here triggers a dump or a profiler "
+                + "unless one was already running; heap/retained/jfr carry whatever is in memory");
+
+        if (include.contains("manifest")) {
+            data.add("manifest", manifestJson());
+        }
+        if (include.contains("health")) {
+            JsonObject o = new JsonObject();
+            o.addProperty("status", "ok");
+            o.addProperty("uptime_ms", System.currentTimeMillis() - startedAtMs);
+            o.addProperty("schema_version", Json.SCHEMA_VERSION);
+            data.add("health", o);
+        }
+        if (include.contains("metrics")) {
+            data.add("metrics", SnapshotJson.metrics(snapshot, 10));
+        }
+        if (include.contains("memory")) {
+            data.add("memory", SnapshotJson.memory(snapshot));
+        }
+        if (include.contains("system")) {
+            data.add("system", SystemStats.system());
+        }
+        if (include.contains("network")) {
+            data.add("network", NetService.json());
+        }
+        if (include.contains("chunks")) {
+            data.add("chunks", SnapshotJson.chunks(snapshot));
+        }
+        if (include.contains("entities")) {
+            data.add("entities", SnapshotJson.entities(snapshot, "type", ObservaConfig.TOP_N_DEFAULT.get()));
+        }
+        if (include.contains("heap")) {
+            data.add("heap", HeapService.instance().json());
+        }
+        if (include.contains("retained")) {
+            data.add("retained", RetainedService.instance().json());
+        }
+        if (include.contains("jfr")) {
+            data.add("jfr", JfrService.instance().status());
+        }
+        Json.sendOk(exchange, data);
     }
 
     private void handleChunks(HttpExchange exchange) throws IOException {
@@ -627,7 +802,13 @@ public final class HttpService implements AutoCloseable {
 
     private void handleProfilerReport(HttpExchange exchange, String id) throws IOException {
         if (id.startsWith("jfr-")) {
-            JsonObject jfrReport = JfrService.instance().report(id);
+            Integer minSamples = queryInt(exchange, "min_samples", 0, 0, 1_000_000);
+            if (minSamples == null) {
+                Json.sendError(exchange, 400, "bad_request", "min_samples must be an integer >= 0",
+                        "GET " + PREFIX + "/profiler/report/" + id + "?min_samples=5");
+                return;
+            }
+            JsonObject jfrReport = JfrService.instance().report(id, minSamples);
             if (jfrReport == null) {
                 Json.sendError(exchange, 404, "not_found", "no report with id " + id,
                         "GET " + PREFIX + "/profiler/status lists recent report ids");
@@ -820,6 +1001,10 @@ public final class HttpService implements AutoCloseable {
 
     // ---- 查询参数 ----
 
+    private static String firstNonNull(String a, String b) {
+        return a != null && !a.isBlank() ? a : b;
+    }
+
     private static String queryParam(HttpExchange exchange, String name) {
         String query = exchange.getRequestURI().getQuery();
         if (query == null || query.isEmpty()) {
@@ -840,6 +1025,10 @@ public final class HttpService implements AutoCloseable {
     /** 返回 null 表示参数非法（调用方负责回 400），缺省返回 {@code fallback}。 */
     private static Integer queryInt(HttpExchange exchange, String name, int fallback, int min, int max) {
         String raw = queryParam(exchange, name);
+        if ((raw == null || raw.isBlank()) && "top".equals(name)) {
+            // 统一口径：凡是「要几行」的地方都同时接受 top= 和 limit=（历史文档两种都出现过）。
+            raw = queryParam(exchange, "limit");
+        }
         if (raw == null || raw.isBlank()) {
             return fallback;
         }
@@ -866,7 +1055,12 @@ public final class HttpService implements AutoCloseable {
         rows.add(new String[]{"POST", "/heap/histogram/start", "available", "body {live, keep_file, top}; dumps the heap (brief STW) and parses it off-thread; the last 5 results are kept for diffing"});
         rows.add(new String[]{"GET", "/heap/histogram/compare?from=&to=&top=20", "available", "diff of two histograms: which classes and which mods grew (defaults to the two most recent runs)"});
         rows.add(new String[]{"GET", "/heap/retained", "available", "last retained size analysis: per class and per mod bytes that go away if it is dropped, plus who dominates it"});
-        rows.add(new String[]{"POST", "/heap/retained/start", "available", "body {live}; dump the heap, build the object graph and run the dominator tree off-thread (heavier than a histogram)"});
+        rows.add(new String[]{"POST", "/heap/retained/start", "available", "body {live, max_objects}; dump the heap, build the object graph and run the dominator tree off-thread; a too-large dump is rejected by preflight with an exact next[]"});
+        rows.add(new String[]{"GET", "/heap/dumps", "available", "recent dump runs with dump_ms/parse_ms and impact (GCs and pause caused by the dump itself)"});
+        rows.add(new String[]{"GET", "/heap/alloc-live?heap_id=&jfr_id=&top=20", "available", "join JFR allocation samples with histogram liveness per class: allocated bytes vs bytes still alive (short aliases heap= and jfr= work too)"});
+        rows.add(new String[]{"POST", "/heap/alloc-live/start?seconds=30", "available", "dump the heap and immediately start JFR so both sides cover the same window; poll /heap/alloc-live afterwards"});
+        rows.add(new String[]{"GET", "/jvm/flags", "available", "effective JVM input args plus static checks (missing -Xms/-XX:MaxMetaspaceSize, dump/log paths, -Xmx vs physical RAM)"});
+        rows.add(new String[]{"GET", "/session/export?include=manifest,metrics,memory,system,heap,jfr", "available", "one read-only bundle of every section; nothing here triggers a dump"});
         rows.add(new String[]{"GET", "/logs?since=60&level=ERROR&limit=20", "available", "deduplicated WARN/ERROR/FATAL events with counts, first/last seen and sample stack (INFO is not retained)"});
         rows.add(new String[]{"GET", "/snapshot", "available", "all of the above in one response"});
         rows.add(new String[]{"GET", "/profiler/status", "available", "current recording state and recent report ids"});
@@ -899,6 +1093,9 @@ public final class HttpService implements AutoCloseable {
         limits.addProperty("metrics_interval_ms", ObservaConfig.METRICS_INTERVAL_MS.get());
         limits.addProperty("rate_limit_per_second", ObservaConfig.RATE_LIMIT_PER_SECOND.get());
         limits.addProperty("profiler_max_seconds", ObservaConfig.PROFILER_MAX_SECONDS.get());
+        limits.addProperty("retained_default_object_limit", com.alvar.observa.collect.HeapGraph.effectiveObjectLimit());
+        limits.addProperty("retained_hard_object_limit", com.alvar.observa.collect.HeapGraph.HARD_MAX_OBJECTS);
+        limits.addProperty("retained_bytes_per_object", com.alvar.observa.collect.HeapGraph.bytesPerObject());
         limits.addProperty("max_response_bytes", 65536);
         limits.addProperty("blackbox_enabled", ObservaConfig.BLACKBOX_ENABLED.get());
         limits.addProperty("blackbox_mspt_threshold_ms", ObservaConfig.BLACKBOX_MSPT_THRESHOLD_MS.get());

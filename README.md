@@ -101,18 +101,24 @@ Invoke-RestMethod -Headers $h http://127.0.0.1:8724/observa/v1/metrics
 |---|---|---|---|
 | GET | `/manifest` | ✅ | 端点清单、限额、约定、鉴权方式 |
 | GET | `/health` | ✅ | 存活、uptime、实际端口、`paused`（单机按 ESC 时为 true） |
-| GET | `/metrics?window=1\|10\|60` | ✅ | TPS / MSPT 分位、堆、实体与区块总量、`headline` 一句话诊断、`flags` |
+| GET | `/metrics?window=1\|10\|60` | ✅ | TPS / MSPT 分位、堆、实体与区块总量、`headline` 一句话诊断、`flags`（含 `stale`/`during_dump`/`during_profiler`） |
 | GET | `/entities?by=type\|dimension\|chunk&top=10` | ✅ | 实体总数、掉落物、经验球、按类型/维度/区块 Top-N |
 | GET | `/memory` | ✅ | 堆与非堆、各内存池、各收集器与上一次 GC 的逐池回收明细、类加载 |
 | GET | `/system` | ✅ | 进程/整机 CPU、物理内存与 swap、进程 uptime/线程、游戏目录所在卷的磁盘 |
 | GET | `/network?top=10` | ✅ | 每玩家 ping（keep-alive RTT）、收发包数/字节数与每秒速率、总计 |
-| GET | `/heap/histogram` | ✅ | 最近一次堆直方图：存活实例数与估算浅尺寸、按类/按包/**按 mod** 聚合，附类→mod 映射来源与 `recent_histograms`（没有就回 `state:"idle"`；条数在 `/heap/histogram/start` 里用 `top` 指定） |
+| GET | `/heap/histogram` | ✅ | 最近一次堆直方图：存活实例数与估算浅尺寸、按类/按包/**按 mod** 聚合，附 `impact`（这次采集自己造成的 GC 次数与停顿）、类→mod 映射来源与 `recent_histograms`（没有就回 `state:"idle"`；条数在 `/heap/histogram/start` 里用 `top`/`limit` 指定） |
 | POST | `/heap/histogram/start` | ✅ | 异步触发一次 dump+解析：`{"live":true,"keep_file":false,"top":25}`，已有一份在跑（或 retained 正在跑）时回 409；结果保留最近 5 份供差分 |
 | GET | `/heap/histogram/compare?from=&to=&top=20` | ✅ | 两次直方图的差分：哪些类、哪个 mod 在涨（`delta_bytes`）；缺省比最近两份，历史不足或同一次运行回 400 |
 | GET | `/heap/retained` | ✅ | 最近一次支配树分析：每类 **retained size**（独占字节，各类互不重叠）、`dominated_by_class`（谁持有），按 mod 汇总（没有就回 `state:"idle"`） |
-| POST | `/heap/retained/start` | ✅ | 异步触发一次 dump + 引用图 + 支配树：`{"live":true}`；同时只跑一份（已在跑或直方图正在 dump 时回 409），`.hprof` 用完即删 |
+| POST | `/heap/retained/start` | ✅ | 异步触发一次 dump + 引用图 + 支配树：`{"live":true,"max_objects":16000000}`；dump 太大时**预检直接拒绝**（回 `too_large` + `next`，不会先 OOM）；同时只跑一份（已在跑或直方图正在 dump 时回 409），`.hprof` 用完即删 |
+| GET | `/heap/dumps` | ✅ | 历次 dump 记录：`dump_ms`/`parse_ms`/`file_bytes` + 瘦身版 `impact`（在内存里，重启清空） |
+| GET | `/heap/alloc-live?heap_id=&jfr_id=&top=20` | ✅ | 把 JFR 分配采样和直方图存活两套口径按类对齐：`alloc_bytes_est` vs `live_bytes`，给 `churn` / `leak_candidate` / `mixed` 判语（`heap=`/`jfr=` 短别名也可用） |
+| POST | `/heap/alloc-live/start?seconds=30` | ✅ | 先 dump 堆、立刻起 JFR，让两侧覆盖同一时间窗；之后轮询 `/heap/alloc-live` |
 | GET | `/chunks` | ✅ | 已加载区块数 + `generated_total`/`generated_per_s`（新生成，不含磁盘读回） |
 | GET | `/snapshot` | ✅ | 以上全量合一（一次请求拿全貌，省往返） |
+| GET | `/session/export?include=manifest,metrics,memory,system,heap,jfr` | ✅ | 一次打包一份分析所需的全部段落（只读，不会触发任何 dump）；省略 `include` 即全部 |
+| GET | `/jvm/flags` | ✅ | 启动参数体检：`input_args` + 解析出的 `heap`/`gc` + `checks[]`（缺 `-Xms`、缺 `MaxMetaspaceSize`、`HeapDumpPath`/`-Xlog` 指到 gameDir 外、`-Xmx` 超过物理内存 75% 等），每条带 `fix` |
+| GET | `/profiler/report/{id}?min_samples=5` | ✅ | 取历史报告；`min_samples` 过滤掉采样数太少的行（`samples=1` 外推出来的噪音），返回 `filtered` 计数 |
 | GET | `/logs?since=60&level=ERROR&limit=20` | ✅ | 跟随 `logs/latest.log`，按签名去重的 WARN/ERROR/FATAL 与计数（INFO 不保留，`level=INFO` 回 400） |
 | POST | `/profiler/start` | ✅ | 开一次录制：`{"mode":"sample"\|"jfr","seconds":15,"interval_ms":5}` |
 | POST | `/profiler/stop` | ✅ | 提前结束录制并返回报告（到点自动结束则回 409，改查 `/profiler/report/{id}`） |
@@ -239,6 +245,45 @@ GET /heap/histogram/compare?from=hist-1&to=hist-2   # 指定 id（GET /heap/hist
 - 内存里保留最近 5 份结果（`recent_histograms`），比 dump 出来的 `.hprof` 便宜得多；超过 5 份丢最旧的一份。
 - `mods[]` 是全量汇总；`classes[]` 只能取到两次快照各自保留的类明细（每份最多 3000 行，见 `/heap/histogram` 的 `classes`），所以规模极大的整合包里，类级 delta 可能漏掉长尾类——看 `mods[]` 更稳。
 - 两次 dump 之间只要发生过 GC 就会抖动，看符号和量级，别逐字节当真；两次间隔太短（或指定的 id 不存在 / 同一次运行）回 400 `not_enough_history`。
+
+#### 采集的代价：`impact`
+
+每次 dump 的响应里都有 `impact`：
+
+```json
+"impact": {
+  "pause_ms": 8500,              // dump 本身的停顿
+  "gc_collections": 2,           // 这次采集期间新增的 GC 次数
+  "gc_pause_ms": 1240,           // 这些 GC 的停顿总和
+  "full_gc_triggered": true,     // 期间有没有跑 full/old 收集器
+  "full_gc_collectors": ["G1 Old Generation"],
+  "heap_used_before_bytes": 7516192768,
+  "heap_used_after_bytes": 6900000000,
+  "heap_used_delta_bytes": -616192768
+}
+```
+
+它存在的理由很实际：dump 会触发一次 `HeapDumpInitiatedGC`，紧跟着可能是一次 `Pause Full`，
+那几百毫秒的卡顿是**采集自己造成的**，但事后看 TPS 曲线会以为是服务器本来就有问题。
+`impact` 把「代价」和「结论」放在同一个响应里，才能回答「这次分析值不值」。
+
+#### dump 太大时：预检而不是 OOM
+
+`/heap/retained` 要在堆里建一整张对象图（约 160 B/对象）。旧实现里上限检查发生在建图过程中，
+所以 5800 万对象的 dump 会先分配完数组、再 OOM——对服务器来说是最糟的失败方式。
+现在第一趟数对象时就检查，超了立刻中止：
+
+```json
+"state": "failed",
+"error": "dump 里有 58612345 个对象，超过 retained 分析上限 21500000（可用堆 8192 MB，每对象约 160 B）",
+"too_large": {"objects": 58612345, "exact": false, "max_objects": 21500000,
+              "required_bytes": 9377975200, "required_mb": 8943},
+"next": ["GET /heap/histogram returns live objects per class without building the object graph",
+         "or raise -Xmx: ... then retry with max_objects=58612345"]
+```
+
+`max_objects` 可以显式放宽，但「可用堆的 40%」这条硬约束仍然生效——超过它就不是「慢一点」，
+而是必然 OOM，那种请求应该在预检阶段被拒绝。
 
 ### `/heap/retained`（支配树 / retained size）
 

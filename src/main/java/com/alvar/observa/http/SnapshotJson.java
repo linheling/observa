@@ -1,7 +1,11 @@
 package com.alvar.observa.http;
 
 import com.alvar.observa.api.Snapshot;
+import com.alvar.observa.collect.HeapService;
 import com.alvar.observa.collect.MemoryDetail;
+import com.alvar.observa.collect.ProfilerService;
+import com.alvar.observa.collect.RetainedService;
+import com.alvar.observa.config.ObservaConfig;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
@@ -51,7 +55,7 @@ public final class SnapshotJson {
         data.add("chunks", chunkView(s.chunks()));
         data.add("players", playerView(s.players(), 0));
         data.addProperty("headline", headline(tick, tpsWindow));
-        data.add("flags", flags(tick));
+        data.add("flags", flags(s, tpsWindow));
         return data;
     }
 
@@ -153,7 +157,7 @@ public final class SnapshotJson {
 
         data.add("chunks", chunkView(s.chunks()));
         data.add("players", playerView(s.players(), 10));
-        data.add("flags", flags(tick));
+        data.add("flags", flags(s, 10));
         return data;
     }
 
@@ -247,7 +251,19 @@ public final class SnapshotJson {
         return String.format("critical: %.1f tps — severe lag, check /entities and /profiler", tps);
     }
 
-    private static JsonArray flags(Snapshot.TickStats tick) {
+    /**
+     * 读这份数据之前应该知道的事实。
+     *
+     * <p>以前这里只有 mspt/tps 三条阈值告警，所以报告里说它「永远是空的」——阈值确实很少触发。
+     * 现在补上三条描述「数据本身可不可信」的标记，它们才是 agent 最该先看的：</p>
+     * <ul>
+     *   <li>{@code stale}：快照比采集间隔晚太多，通常是服务器停了 tick（单人按 ESC）或卡住了；</li>
+     *   <li>{@code during_dump}：堆 dump 正在跑，这一秒的 MSPT 偏高是采集自己造成的；</li>
+     *   <li>{@code during_profiler}：采样剖析在跑，数字同样是带代价的。</li>
+     * </ul>
+     */
+    private static JsonArray flags(Snapshot s, int tpsWindow) {
+        Snapshot.TickStats tick = s.tick();
         JsonArray flags = new JsonArray();
         if (tick.p99Ms() > 50.0) {
             flags.add(String.format("mspt_spiky: p99=%.1fms over 50ms budget", tick.p99Ms()));
@@ -256,6 +272,19 @@ public final class SnapshotJson {
         }
         if (tick.tps1m() != null && tick.tps1m() < 19.0) {
             flags.add(String.format("tps_low: 1m=%.2f", tick.tps1m()));
+        }
+
+        long ageMs = Math.max(0L, System.currentTimeMillis() - s.collectedAtMs());
+        long interval = Math.max(1000, ObservaConfig.METRICS_INTERVAL_MS.get());
+        if (ageMs > interval * 5) {
+            flags.add(String.format("stale: sample is %.1fs old — the server thread is not ticking "
+                    + "(paused, frozen or shutting down); numbers below describe that moment", ageMs / 1000.0));
+        }
+        if (HeapService.instance().running() || RetainedService.instance().running()) {
+            flags.add("during_dump: a heap dump is in progress — mspt here includes the dump's pause");
+        }
+        if (ProfilerService.get() != null && ProfilerService.get().status() != null) {
+            flags.add("during_profiler: a sampling profiler is running — overhead is included");
         }
         return flags;
     }

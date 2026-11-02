@@ -3,6 +3,7 @@ package com.alvar.observa.collect;
 import com.alvar.observa.Observa;
 import com.alvar.observa.config.ObservaConfig;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import jdk.jfr.Recording;
@@ -16,6 +17,7 @@ import jdk.jfr.consumer.RecordingFile;
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -212,7 +214,33 @@ public final class JfrService {
         return data;
     }
 
+    /**
+     * 兼容入口：等价于 {@code report(id, 0)}（不过滤）。
+     *
+     * <p>保留这个重载是因为老的 agent / 脚本按这个签名取报告；加过滤能力不该让它们编译不过。</p>
+     */
     public synchronized JsonObject report(String id) {
+        return report(id, 0);
+    }
+
+    /**
+     * 取一份已解析的报告，可按样本数过滤。
+     *
+     * <p>为什么要能过滤：{@code jdk.ObjectAllocationSample} 默认按 200/s 限速，一次 30 秒的
+     * 录制可能只给某个类 1 个样本，而 {@code bytes_est} 是把这个样本按权重外推出来的——
+     * 几十 GB 的数字是「采样放大」不是物理占用。按 {@code samples >= N} 过滤后留下的行
+     * 才是「反复出现」的分配，判断谁真占内存时更可信。</p>
+     *
+     * @param id         报告 id
+     * @param minSamples 阈值，{@code <= 0} 表示不过滤；过滤只作用于
+     *                   {@code allocations.top} / {@code allocations.top_sites}（按 {@code samples}）
+     *                   与 {@code old_objects.top}（按 {@code count}）
+     * @return 报告 JSON；id 未知时返回 {@code null}（调用方回 404）。过滤后的返回里多一个
+     *         {@code filtered:{min_samples, rows_dropped}}
+     * @implNote 过滤只删行，不重算 {@code total_bytes_est} / {@code pct}：百分比仍相对全量总量，
+     *           这样「过滤后剩下的这几行占多少」还能读出来。
+     */
+    public synchronized JsonObject report(String id, int minSamples) {
         JfrReport found = null;
         for (JfrReport candidate : history) {
             if (candidate.id().equals(id)) {
@@ -231,12 +259,12 @@ public final class JfrService {
                         found.durationMs(), found.file(), found.fileBytes(), retry);
                 history.remove(found);
                 history.addFirst(refreshed);
-                return reportJson(refreshed);
+                return filtered(reportJson(refreshed), minSamples);
             } catch (Throwable t) {
                 // 仍然失败：把原始错误留在报告里，别把 .jfr 路径弄丢。
             }
         }
-        return reportJson(found);
+        return filtered(reportJson(found), minSamples);
     }
 
     public synchronized JsonObject status() {
@@ -282,12 +310,89 @@ public final class JfrService {
         JsonArray notes = new JsonArray();
         notes.add("summary is aggregated from the .jfr file; raw events stay in the file for 'jfr print'");
         notes.add("allocation weights are JFR-sampled estimates, not exact byte counts");
+        notes.add("allocations.confidence / implausible flag low-sample extrapolation (samples near 1 can "
+                + "inflate bytes_est to tens of GB); report(id, minSamples) drops rows with too few samples");
         notes.add("mod_id attributes a class to a mod; site_mod_id attributes the allocating frame — "
                 + "use site_mod_id to catch 'vanilla class allocated by a mod'");
         notes.add("old_objects comes from jdk.OldObjectSample: only objects that survived young GCs are sampled "
                 + "(bytes_est is last known heap usage, not retained size)");
         data.add("notes", notes);
         return data;
+    }
+
+    // ---------------------------------------------------------------- 报告过滤
+
+    /**
+     * 按 minSamples 过滤报告里的分配 / 长寿对象行。
+     *
+     * <p>必须先 {@link JsonObject#deepCopy()}：{@code reportJson} 把历史里那份 summary 直接
+     * 挂进返回对象，原地删行会污染后续「不过滤」的读取（例如 AllocLive 对齐时要复用同一份
+     * summary）。拷贝只发生在真的带阈值取报告时，summary 只有几十行，代价可以忽略。</p>
+     */
+    private static JsonObject filtered(JsonObject report, int minSamples) {
+        if (minSamples <= 0) {
+            return report;
+        }
+        JsonObject out = report.deepCopy();
+        int dropped = 0;
+        JsonObject summary = out.has("summary") && out.get("summary").isJsonObject()
+                ? out.getAsJsonObject("summary") : null;
+        if (summary != null) {
+            JsonObject allocations = summary.has("allocations") && summary.get("allocations").isJsonObject()
+                    ? summary.getAsJsonObject("allocations") : null;
+            if (allocations != null) {
+                dropped += filterRows(allocations, "top", "samples", minSamples);
+                dropped += filterRows(allocations, "top_sites", "samples", minSamples);
+            }
+            JsonObject old = summary.has("old_objects") && summary.get("old_objects").isJsonObject()
+                    ? summary.getAsJsonObject("old_objects") : null;
+            if (old != null) {
+                // old_objects 的行没有 samples 字段，用 count（该「类 + 分配点」被采到的对象数）
+                dropped += filterRows(old, "top", "count", minSamples);
+            }
+        }
+        JsonObject meta = new JsonObject();
+        meta.addProperty("min_samples", minSamples);
+        meta.addProperty("rows_dropped", dropped);
+        out.add("filtered", meta);
+        return out;
+    }
+
+    /**
+     * 删掉 {@code parent[arrayKey]} 里计数字段小于阈值的行。
+     *
+     * <p>缺这个字段的行保持不动：读不出计数的行不该被当成 0 悄悄丢掉（字段名会随 JDK 版本
+     * 变化，宁可多留一行，也不要少给证据）。</p>
+     */
+    private static int filterRows(JsonObject parent, String arrayKey, String countField, int min) {
+        if (!parent.has(arrayKey) || !parent.get(arrayKey).isJsonArray()) {
+            return 0;
+        }
+        JsonArray kept = new JsonArray();
+        int dropped = 0;
+        for (JsonElement element : parent.getAsJsonArray(arrayKey)) {
+            if (!element.isJsonObject()) {
+                kept.add(element);
+                continue;
+            }
+            JsonObject row = element.getAsJsonObject();
+            JsonElement count = row.get(countField);
+            if (count == null || count.isJsonNull()) {
+                kept.add(row);
+                continue;
+            }
+            try {
+                if (count.getAsLong() < min) {
+                    dropped++;
+                } else {
+                    kept.add(row);
+                }
+            } catch (RuntimeException e) {
+                kept.add(row); // 不是数字：同样不做判断
+            }
+        }
+        parent.add(arrayKey, kept);
+        return dropped;
     }
 
     // ---------------------------------------------------------------- 解析
@@ -402,19 +507,50 @@ public final class JfrService {
 
         // ---- 分配：按字节降序，给 Pct 方便直接判读
         long allocTotal = allocations.values().stream().mapToLong(s -> s[0]).sum();
+        long allocSamples = allocations.values().stream().mapToLong(s -> s[1]).sum();
+        double durationS = durationMs / 1000.0;
+        // 分配总量是「权重外推」不是计数器：拿堆上限当物理上限做一次粗校验。
+        // 连「每秒 2 倍堆容量」这种宽松上限都被超过，说明这个总量连速率上都讲不通——
+        // 那就只能是低样本放大（单个样本按权重外推出几十 GB），不是物理占用。
+        long heapMaxBytes = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax();
+        boolean implausible = heapMaxBytes > 0 && durationS > 0
+                && (double) allocTotal > (double) heapMaxBytes * durationS * 2.0;
+
         JsonObject alloc = new JsonObject();
         alloc.addProperty("total_bytes_est", allocTotal);
-        alloc.addProperty("sample_count", allocations.values().stream().mapToLong(s -> s[1]).sum());
+        alloc.addProperty("sample_count", allocSamples);
+        // duration_s / mb_per_s：把「30 秒录到 60.6 GB」换算成人能判读的速率（≈2 GB/s）。
+        // 单独看总量分不清「一次长录制积累的多」和「速率爆炸」，有速率才好判断可不可能。
+        alloc.addProperty("duration_s", round2(durationS));
+        alloc.addProperty("mb_per_s", durationS <= 0 ? 0.0 : round2(allocTotal / durationS / (1024.0 * 1024.0)));
+        alloc.add("confidence", allocConfidence(allocSamples, events));
+        alloc.addProperty("implausible", implausible);
+        if (implausible) {
+            alloc.addProperty("implausible_reason", "total_bytes_est (" + allocTotal + " B = "
+                    + round2(allocTotal / (1024.0 * 1024.0)) + " MiB) over " + round2(durationS)
+                    + " s is more than twice the heap max (" + round2(heapMaxBytes / (1024.0 * 1024.0))
+                    + " MiB) per second: at that rate the heap would be full within a second or two, "
+                    + "so this is almost certainly a low-sample extrapolation, not real usage");
+        } else if (heapMaxBytes <= 0 || durationS <= 0) {
+            alloc.addProperty("implausible_note",
+                    "heap max not reported (<=0) or zero duration; plausibility check skipped");
+        }
         JsonArray allocTop = new JsonArray();
         allocations.entrySet().stream()
                 .sorted(Comparator.comparingLong((Map.Entry<String, long[]> e) -> e.getValue()[0]).reversed())
                 .limit(TOP_N)
                 .forEach(e -> {
+                    long samples = e.getValue()[1];
                     JsonObject row = new JsonObject();
                     row.addProperty("class", e.getKey());
                     row.addProperty("mod_id", ModIndex.get().modOfClass(e.getKey()).modId());
                     row.addProperty("bytes_est", e.getValue()[0]);
                     row.addProperty("pct", allocTotal == 0 ? 0.0 : round2(e.getValue()[0] * 100.0 / allocTotal));
+                    // samples + 平均权重：读的人（或 agent）靠这两个数判断这行是「1 个样本被放大」
+                    // 还是「反复出现的真分配」——只有字节总量的话两者长得一模一样。
+                    row.addProperty("samples", samples);
+                    row.addProperty("avg_weight_bytes",
+                            samples <= 0 ? 0L : Math.round((double) e.getValue()[0] / samples));
                     allocTop.add(row);
                 });
         alloc.add("top", allocTop);
@@ -515,6 +651,43 @@ public final class JfrService {
         summary.add("monitor_enter", durationSummary(monitor));
         summary.add("thread_park", durationSummary(park));
         return summary;
+    }
+
+    /**
+     * 分配数据的可信度标签。
+     *
+     * <p>为什么不能只给数字：权重外推的误差随样本数下降得很快，但在 JSON 里
+     * 「1 个样本 → 60.6 GB」和「500 个样本 → 3 GB」长得一样像真数据。等级让读的人
+     * （或 agent）先决定要不要信这个总量，再决定要不要继续深挖——这是这次实战里
+     * 最容易误导结论的一处。</p>
+     *
+     * <p>阈值取 20 / 200：200/s 限速下 20 个样本约等于 0.1 秒的有效采样，只能算「出现过」；
+     * 200 个样本（约 1 秒以上有效采样）才够排名的稳定性。</p>
+     */
+    private static JsonObject allocConfidence(long samples, long events) {
+        String level;
+        String note;
+        if (samples < 20) {
+            level = "low";
+            note = "only " + samples + " allocation sample(s) in the whole recording (throttled to 200/s): "
+                    + "bytes_est is the weight of those few samples extrapolated - one sample turning into "
+                    + "tens of GB does not mean that much memory is physically occupied; record longer, or "
+                    + "filter with min_samples, before quoting any byte number";
+        } else if (samples < 200) {
+            level = "medium";
+            note = samples + " allocation samples: enough to rank classes, still coarse for absolute bytes; "
+                    + "use it to compare classes against each other, not as a residency figure";
+        } else {
+            level = "high";
+            note = samples + " allocation samples: class ranking and the rough byte total are reliable; "
+                    + "per-class bytes are still weighted estimates, not exact counters";
+        }
+        JsonObject confidence = new JsonObject();
+        confidence.addProperty("level", level);
+        confidence.addProperty("samples", samples);
+        confidence.addProperty("events", events);
+        confidence.addProperty("note", note);
+        return confidence;
     }
 
     // ------------------------------------------------------------------ 栈帧归属
