@@ -48,6 +48,16 @@ public final class MetricsService {
      */
     private static volatile long lastTickEndMs = -1L;
 
+    /**
+     * 最近一次观测到 GC 计数变化的墙钟时间；-1 表示还没采到过变化。
+     *
+     * <p>MXBean 只给「累计了几次」，没有「上一次暂停发生在几点」。这里用每次聚合时
+     * 对比累计计数来推：计数涨了就记下此刻。<b>精度是采样间隔</b>（默认 1 s），
+     * 所以对外只能承诺「最近 N 秒内发生过 GC」，不能承诺「此刻正在 GC」。
+     */
+    private static volatile long gcChangeAtMs = -1L;
+    private static volatile long gcCountSeen = -1L;
+
     private final TickMeter meter = new TickMeter();
     private volatile Snapshot snapshot;
     private volatile long lastRefreshMs;
@@ -64,6 +74,15 @@ public final class MetricsService {
     /** 上一次 tick 完成的墙钟时间；还没跑完第一个 tick 时是 -1。 */
     public static long lastTickEndMs() {
         return lastTickEndMs;
+    }
+
+    /**
+     * 距离最近一次观测到 GC 计数变化过了多少毫秒；没观测到过时返回 {@link Long#MAX_VALUE}。
+     * 精度受采样间隔限制（默认 1 s），见 {@code gcChangeAtMs}。
+     */
+    public static long msSinceLastGcChange() {
+        long at = gcChangeAtMs;
+        return at < 0 ? Long.MAX_VALUE : System.currentTimeMillis() - at;
     }
 
     // ------------------------------------------------------------------ tick 钩子
@@ -101,6 +120,7 @@ public final class MetricsService {
     // ------------------------------------------------------------------ 聚合
 
     private Snapshot build(MinecraftServer server, long now) {
+        sampleGcPulse();
         double[] tickStats = meter.percentilesAndAverage();
         Snapshot.TickStats tick = new Snapshot.TickStats(
                 round(meter.currentMspt()),
@@ -117,8 +137,26 @@ public final class MetricsService {
                 readMemory(), countEntities(server), countChunks(server, now), collectPlayers(server));
     }
 
-    private static Snapshot.MemoryStats readMemory() {
-        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
+    /**
+     * 记一次 GC 累计计数；涨了就更新 {@link #gcChangeAtMs}。
+     * 只有「观测到变化」这一种事件，第一次采样只用来建立基线。
+     */
+    private static void sampleGcPulse() {
+        long total = 0;
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            long count = gc.getCollectionCount();
+            if (count > 0) {
+                total += count;
+            }
+        }
+        long previous = gcCountSeen;
+        gcCountSeen = total;
+        if (previous >= 0 && total > previous) {
+            gcChangeAtMs = System.currentTimeMillis();
+        }
+    }
+
+    private static Snapshot.MemoryStats readMemory() {        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
         MemoryUsage heap = memory.getHeapMemoryUsage();
         long gcCount = 0;
         long gcTime = 0;

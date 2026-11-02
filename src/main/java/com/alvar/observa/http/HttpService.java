@@ -8,6 +8,7 @@ import com.alvar.observa.collect.AllocLive;
 import com.alvar.observa.collect.JvmFlags;
 import com.alvar.observa.collect.MetricsService;
 import com.alvar.observa.collect.HeapService;
+import com.alvar.observa.collect.HeapTimeseries;
 import com.alvar.observa.collect.JfrService;
 import com.alvar.observa.collect.NetService;
 import com.alvar.observa.collect.PauseState;
@@ -59,6 +60,20 @@ public final class HttpService implements AutoCloseable {
     public static final String PREFIX = "/observa/v1";
     private static final String BIND_ADDRESS = "127.0.0.1";
     private static final int MAX_PORT_ATTEMPTS = 10;
+
+    /** {@code /session/export?include=} 允许的段名，顺序即默认导出顺序。 */
+    private static final List<String> SESSION_SECTIONS = List.of(
+            "manifest", "health", "metrics", "memory", "system", "network",
+            "chunks", "entities", "heap", "retained", "jfr");
+
+    /**
+     * 段名别名。报告和文档里 {@code histogram} 比 {@code heap} 更常见，
+     * 静默丢掉未知段名会让调用方以为导出了、其实没有——所以要么认别名，要么报 400。
+     */
+    private static final Map<String, String> SESSION_ALIASES = Map.of(
+            "histogram", "heap",
+            "histograms", "heap",
+            "heap_histogram", "heap");
 
     private static HttpService instance;
 
@@ -176,6 +191,7 @@ public final class HttpService implements AutoCloseable {
         route("/heap/histogram", new Route("GET", this::handleHeapHistogram));
         route("/heap/histogram/start", new Route("POST", this::handleHeapStart));
         route("/heap/histogram/compare", new Route("GET", this::handleHeapCompare));
+        route("/heap/histogram/timeseries", new Route("GET", this::handleHeapTimeseries));
         route("/heap/retained", new Route("GET", this::handleRetained));
         route("/heap/retained/start", new Route("POST", this::handleRetainedStart));
         route("/heap/dumps", new Route("GET", this::handleHeapDumps));
@@ -308,7 +324,97 @@ public final class HttpService implements AutoCloseable {
         rules.add("null means not collected yet; never assume 0");
         rules.add("top-N is computed server-side; pass top=N to change size");
         data.add("conventions", rules);
+        // 机器可读的响应 schema：从此刻的真实 payload 推导字段类型，避免手写文档慢慢漂移。
+        data.add("response_schema", responseSchema());
         return data;
+    }
+
+    /** schema 推导的最大深度：再深就只剩「对象」这一层意思，没有信息量。 */
+    private static final int SCHEMA_DEPTH = 3;
+
+    /**
+     * 每个只读端点此刻的响应长什么样（字段名 → 类型）。
+     *
+     * <p>为什么这样做而不是手写一份 schema：手写的会漂。这里直接拿同一个构造函数跑一遍，
+     * 端点改了字段，schema 自动跟着改。代价是 manifest 会稍大一点，所以只收便宜的端点——
+     * 会触发 dump 的端点不在此列。</p>
+     */
+    private JsonObject responseSchema() {
+        JsonObject schemas = new JsonObject();
+        schemas.addProperty("note", "types are derived from a live sample at manifest time; "
+                + "arrays show the element shape");
+        Snapshot s = MetricsService.snapshot();
+        if (s != null) {
+            addSchema(schemas, "GET /metrics", SnapshotJson.metrics(s, 10));
+            addSchema(schemas, "GET /memory", SnapshotJson.memory(s));
+            addSchema(schemas, "GET /system", SystemStats.system());
+            addSchema(schemas, "GET /network", NetService.json());
+            addSchema(schemas, "GET /chunks", SnapshotJson.chunks(s));
+            addSchema(schemas, "GET /entities", SnapshotJson.entities(s, "type", 3));
+            addSchema(schemas, "GET /snapshot", SnapshotJson.full(s));
+        }
+        addSchema(schemas, "GET /jvm/flags", JvmFlags.json());
+        addSchema(schemas, "GET /heap/histogram", HeapService.instance().json());
+        addSchema(schemas, "GET /heap/retained", RetainedService.instance().json());
+        addSchema(schemas, "GET /heap/histogram/timeseries", HeapTimeseries.instance().json(1_800, 3));
+        addSchema(schemas, "GET /profiler/status", JfrService.instance().status());
+        addSchema(schemas, "GET /heap/dumps", heapDumpsShape());
+        return schemas;
+    }
+
+    private void addSchema(JsonObject schemas, String endpoint, JsonObject payload) {
+        schemas.add(endpoint, describe(payload, 0));
+    }
+
+    /** 把一份真实 JSON 压成「字段名 → 类型」；数组只描述第一个元素。 */
+    private static JsonElement describe(JsonElement e, int depth) {
+        if (e == null || e.isJsonNull()) {
+            return new com.google.gson.JsonPrimitive("null");
+        }
+        if (e.isJsonPrimitive()) {
+            com.google.gson.JsonPrimitive p = e.getAsJsonPrimitive();
+            if (p.isBoolean()) {
+                return new com.google.gson.JsonPrimitive("boolean");
+            }
+            return new com.google.gson.JsonPrimitive(p.isNumber() ? "number" : "string");
+        }
+        if (e.isJsonArray()) {
+            JsonArray in = e.getAsJsonArray();
+            JsonArray out = new JsonArray();
+            if (!in.isEmpty()) {
+                out.add(depth >= SCHEMA_DEPTH ? new com.google.gson.JsonPrimitive("...")
+                        : describe(in.get(0), depth + 1));
+            }
+            return out;
+        }
+        JsonObject in = e.getAsJsonObject();
+        JsonObject out = new JsonObject();
+        for (Map.Entry<String, JsonElement> entry : in.entrySet()) {
+            out.add(entry.getKey(), depth >= SCHEMA_DEPTH
+                    ? new com.google.gson.JsonPrimitive("...")
+                    : describe(entry.getValue(), depth + 1));
+        }
+        return out;
+    }
+
+    /** {@code /heap/dumps} 的形状：避免为了 schema 把整个 dumps 数组再构建一遍。 */
+    private static JsonObject heapDumpsShape() {
+        JsonObject shape = new JsonObject();
+        shape.addProperty("count", 0);
+        JsonArray dumps = new JsonArray();
+        JsonObject row = new JsonObject();
+        row.addProperty("id", "heap-1");
+        row.addProperty("state", "done");
+        row.addProperty("dump_ms", 0);
+        row.addProperty("parse_ms", 0);
+        row.addProperty("file_bytes", 0);
+        row.addProperty("file_kept", false);
+        row.addProperty("total_instances", 0);
+        row.addProperty("total_shallow_bytes", 0);
+        dumps.add(row);
+        shape.add("dumps", dumps);
+        shape.addProperty("note", "history is in memory only and resets on restart");
+        return shape;
     }
 
     private void handleHealth(HttpExchange exchange) throws IOException {
@@ -332,9 +438,12 @@ public final class HttpService implements AutoCloseable {
         if (snapshot == null) {
             return;
         }
-        Integer window = queryInt(exchange, "window", 10, 1, 60);
+        // window 与 since_seconds 是同一个意思的两个名字，都认；也接受 60s 这种写法。
+        String rawWindow = firstNonNull(queryParam(exchange, "window"), queryParam(exchange, "since_seconds"));
+        Integer window = parseDurationSeconds(rawWindow, 10, 1, 60);
         if (window == null || (window != 1 && window != 10 && window != 60)) {
-            Json.sendError(exchange, 400, "bad_request", "window must be 1, 10 or 60",
+            Json.sendError(exchange, 400, "bad_request",
+                    "window must be 1, 10 or 60 seconds (accepts 10, 10s, since_seconds=10)",
                     "GET " + PREFIX + "/metrics?window=10");
             return;
         }
@@ -516,7 +625,21 @@ public final class HttpService implements AutoCloseable {
                     "two dumps at once would each stop the world for nothing");
             return;
         }
-        if (!RetainedService.instance().start(live, false, maxObjects)) {
+        String mode = stringOr(body, "mode", "full");
+        if (!"lean".equalsIgnoreCase(mode) && !"full".equalsIgnoreCase(mode)) {
+            Json.sendError(exchange, 400, "bad_request", "mode must be either 'full' or 'lean'",
+                    "omit mode for the default full graph (160 bytes per object budget)",
+                    "mode=lean budgets 96 bytes per object: ~1.6x more objects fit, per-class precision drops");
+            return;
+        }
+        boolean lean = "lean".equalsIgnoreCase(mode);
+        if (HeapService.instance().running()) {
+            Json.sendError(exchange, 409, "conflict", "a heap histogram dump is already running",
+                    "GET " + PREFIX + "/heap/histogram for progress, retry when it is done",
+                    "two dumps at once would each stop the world for nothing");
+            return;
+        }
+        if (!RetainedService.instance().start(live, false, maxObjects, lean)) {
             Json.sendError(exchange, 409, "conflict", "a retained size analysis is already running",
                     "GET " + PREFIX + "/heap/retained for progress",
                     "wait for it to finish (it builds the whole object graph)");
@@ -528,11 +651,26 @@ public final class HttpService implements AutoCloseable {
         if (maxObjects > 0) {
             data.addProperty("max_objects", maxObjects);
         }
+        data.addProperty("mode", lean ? "lean" : "full");
         data.addProperty("object_limit",
-                com.alvar.observa.collect.HeapGraph.effectiveObjectLimit(maxObjects));
+                com.alvar.observa.collect.HeapGraph.effectiveObjectLimit(maxObjects,
+                        lean ? com.alvar.observa.collect.HeapGraph.leanBytesPerObject()
+                             : com.alvar.observa.collect.HeapGraph.bytesPerObject()));
         data.addProperty("next", "poll GET " + PREFIX + "/heap/retained in a few seconds; if the dump is too big "
                 + "the response carries too_large plus a next[] with the exact numbers to raise");
         Json.send(exchange, 202, Json.ok(data));
+    }
+
+    /** 取 JSON body 里的字符串字段，缺省或类型不对时返回 {@code fallback}。 */
+    private static String stringOr(JsonObject body, String key, String fallback) {
+        if (body == null || !body.has(key) || body.get(key).isJsonNull()) {
+            return fallback;
+        }
+        try {
+            return body.get(key).getAsString();
+        } catch (RuntimeException e) {
+            return fallback;
+        }
     }
 
     /**
@@ -615,15 +753,37 @@ public final class HttpService implements AutoCloseable {
     private void handleSessionExport(HttpExchange exchange) throws IOException {
         String raw = queryParam(exchange, "include");
         Set<String> include = new LinkedHashSet<>();
+        List<String> unknown = new ArrayList<>();
         if (raw == null || raw.isBlank()) {
-            include.addAll(List.of("manifest", "health", "metrics", "memory", "system", "network",
-                    "chunks", "entities", "heap", "retained", "jfr"));
+            include.addAll(SESSION_SECTIONS);
         } else {
             for (String part : raw.split(",")) {
-                if (!part.isBlank()) {
-                    include.add(part.trim().toLowerCase(Locale.ROOT));
+                if (part.isBlank()) {
+                    continue;
+                }
+                String name = part.trim().toLowerCase(Locale.ROOT);
+                // 别名：报告里叫 histogram 的，内部段名是 heap；认别名，别静默丢掉。
+                name = SESSION_ALIASES.getOrDefault(name, name);
+                if (!SESSION_SECTIONS.contains(name)) {
+                    unknown.add(name);
+                } else {
+                    include.add(name);
                 }
             }
+        }
+        if (!unknown.isEmpty()) {
+            Json.sendError(exchange, 400, "unknown_section",
+                    "unknown include section(s): " + String.join(", ", unknown),
+                    "allowed: " + String.join(",", SESSION_SECTIONS),
+                    "histogram is an alias of heap",
+                    "GET " + PREFIX + "/session/export?include=manifest,metrics,heap");
+            return;
+        }
+        if (include.isEmpty()) {
+            Json.sendError(exchange, 400, "empty_include",
+                    "include was given but matched no section",
+                    "allowed: " + String.join(",", SESSION_SECTIONS));
+            return;
         }
         Snapshot snapshot = requireSnapshot(exchange);
         if (snapshot == null) {
@@ -672,6 +832,77 @@ public final class HttpService implements AutoCloseable {
             data.add("jfr", JfrService.instance().status());
         }
         Json.sendOk(exchange, data);
+    }
+
+    /**
+     * by_mod 的时间序列：回答「哪个 mod 一直在涨」。
+     *
+     * <p>{@code window} 接受 {@code 30m} / {@code 2h} / {@code 1800} / {@code 1800s} 这几种写法；
+     * 样本点是「每次 dump 完成」——每次 dump 都会停世界，所以不提供自动高频采样。</p>
+     */
+    private void handleHeapTimeseries(HttpExchange exchange) throws IOException {
+        String rawWindow = queryParam(exchange, "window");
+        Integer window = parseDurationSeconds(rawWindow, 1_800, 60, 30 * 24 * 3_600);
+        if (window == null) {
+            Json.sendError(exchange, 400, "bad_request",
+                    "window must be a duration like 30m, 2h or a number of seconds (60 .. 259200)",
+                    "GET " + PREFIX + "/heap/histogram/timeseries?window=30m&limit=20");
+            return;
+        }
+        Integer limit = queryInt(exchange, "limit", 20, 1, 200);
+        if (limit == null) {
+            Json.sendError(exchange, 400, "bad_request", "limit must be an integer between 1 and 200",
+                    "GET " + PREFIX + "/heap/histogram/timeseries?window=30m&limit=20");
+            return;
+        }
+        JsonObject data = HeapTimeseries.instance().json(window, limit);
+        data.addProperty("timeseries_samples_stored", HeapTimeseries.instance().size());
+        Json.sendOk(exchange, data);
+    }
+
+    /**
+     * 解析「30m / 2h / 90s / 1800」这类窗口写法。
+     *
+     * <p>报告里抱怨过 {@code since_seconds} 和 {@code window} 各自一套单位；
+     * 这里统一成一个入口：纯数字按秒，带后缀按后缀。
+     *
+     * @return 解析失败返回 {@code null}（调用方回 400）
+     */
+    private static Integer parseDurationSeconds(String raw, int fallback, int min, int max) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        String text = raw.trim().toLowerCase(Locale.ROOT);
+        long multiplier = 1L;
+        if (text.endsWith("ms")) {
+            return null; // 毫秒对这个窗口没有意义，直接拒绝，别悄悄当成秒
+        }
+        if (text.endsWith("s")) {
+            text = text.substring(0, text.length() - 1);
+        } else if (text.endsWith("m")) {
+            text = text.substring(0, text.length() - 1);
+            multiplier = 60L;
+        } else if (text.endsWith("h")) {
+            text = text.substring(0, text.length() - 1);
+            multiplier = 3_600L;
+        } else if (text.endsWith("d")) {
+            text = text.substring(0, text.length() - 1);
+            multiplier = 86_400L;
+        } else if (text.endsWith("w")) {
+            text = text.substring(0, text.length() - 1);
+            multiplier = 604_800L;
+        }
+        long value;
+        try {
+            value = Long.parseLong(text.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        long seconds = value * multiplier;
+        if (seconds < min || seconds > max) {
+            return null;
+        }
+        return (int) seconds;
     }
 
     private void handleChunks(HttpExchange exchange) throws IOException {
@@ -830,7 +1061,8 @@ public final class HttpService implements AutoCloseable {
     // ---- 黑匣子 / 日志端点 ----
 
     private void handleLogs(HttpExchange exchange) throws IOException {
-        Integer since = queryInt(exchange, "since", 60, 0, 86_400);
+        String rawSince = firstNonNull(queryParam(exchange, "since"), queryParam(exchange, "since_seconds"));
+        Integer since = parseDurationSeconds(rawSince, 60, 0, 86_400);
         if (since == null) {
             Json.sendError(exchange, 400, "bad_request", "since must be seconds between 0 and 86400",
                     "GET " + PREFIX + "/logs?since=60&level=ERROR");
@@ -1096,6 +1328,9 @@ public final class HttpService implements AutoCloseable {
         limits.addProperty("retained_default_object_limit", com.alvar.observa.collect.HeapGraph.effectiveObjectLimit());
         limits.addProperty("retained_hard_object_limit", com.alvar.observa.collect.HeapGraph.HARD_MAX_OBJECTS);
         limits.addProperty("retained_bytes_per_object", com.alvar.observa.collect.HeapGraph.bytesPerObject());
+        limits.addProperty("retained_lean_bytes_per_object", com.alvar.observa.collect.HeapGraph.leanBytesPerObject());
+        limits.addProperty("retained_lean_object_limit", com.alvar.observa.collect.HeapGraph.effectiveObjectLimit(0,
+                com.alvar.observa.collect.HeapGraph.leanBytesPerObject()));
         limits.addProperty("max_response_bytes", 65536);
         limits.addProperty("blackbox_enabled", ObservaConfig.BLACKBOX_ENABLED.get());
         limits.addProperty("blackbox_mspt_threshold_ms", ObservaConfig.BLACKBOX_MSPT_THRESHOLD_MS.get());

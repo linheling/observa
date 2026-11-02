@@ -1,8 +1,11 @@
 package com.alvar.observa.http;
 
 import com.alvar.observa.api.Snapshot;
+import com.alvar.observa.collect.GcWatch;
 import com.alvar.observa.collect.HeapService;
 import com.alvar.observa.collect.MemoryDetail;
+import com.alvar.observa.collect.MetricsService;
+import com.alvar.observa.collect.OffHeap;
 import com.alvar.observa.collect.ProfilerService;
 import com.alvar.observa.collect.RetainedService;
 import com.alvar.observa.config.ObservaConfig;
@@ -19,6 +22,9 @@ import java.util.Map;
  * <p>字段名自带单位是刻意设计：agent 不用查文档就能判断 21.4 是毫秒还是刻。
  */
 public final class SnapshotJson {
+
+    /** 「最近发生过 GC」的判定窗：MXBean 采样精度是 1 s，取 3 s 留两次采样的余量。 */
+    private static final long GC_RECENT_MS = 3_000L;
 
     private SnapshotJson() {
     }
@@ -97,11 +103,18 @@ public final class SnapshotJson {
         data.add("memory", memory(s.memory()));
         // 池/收集器/上一次 GC 是现算的（不再是快照的一部分），因为它们只在被读时才有人关心。
         data.add("detail", MemoryDetail.detail());
+        // 堆外拆分与「最近一次 GC 窗口」：回答「堆只用了 700 MB，为什么进程占了 12 GB」和「刚才那阵卡顿是不是 GC」。
+        data.add("off_heap", OffHeap.json());
+        data.add("gc_recent", GcWatch.json());
         data.addProperty("top_classes", (String) null);
         JsonArray notes = new JsonArray();
         notes.add("top_classes is null on purpose: live instance counts come from /heap/histogram, "
                 + "while a JFR recording only gives allocation volume (how much was allocated, not what is still alive)");
         notes.add("detail.pools and detail.collectors explain which generation is busy; see detail.collectors[].last_gc");
+        notes.add("off_heap splits the non-heap side (direct/mapped buffers, code cache, threads, NMT when enabled); "
+                + "nmt is unavailable unless the server started with -XX:NativeMemoryTracking=summary");
+        notes.add("gc_recent is a window over the last minute (collections/pause_ms/per_collector); "
+                + "evacuation/humongous/MMU counts come from the gc log and are absent if -Xlog:gc is not configured");
         data.add("notes", notes);
         return data;
     }
@@ -260,6 +273,7 @@ public final class SnapshotJson {
      *   <li>{@code stale}：快照比采集间隔晚太多，通常是服务器停了 tick（单人按 ESC）或卡住了；</li>
      *   <li>{@code during_dump}：堆 dump 正在跑，这一秒的 MSPT 偏高是采集自己造成的；</li>
      *   <li>{@code during_profiler}：采样剖析在跑，数字同样是带代价的。</li>
+     *   <li>{@code during_gc}：最近 3 秒内观测到 GC 计数变化（精度受 1 秒采样间隔限制）。</li>
      * </ul>
      */
     private static JsonArray flags(Snapshot s, int tpsWindow) {
@@ -285,6 +299,11 @@ public final class SnapshotJson {
         }
         if (ProfilerService.get() != null && ProfilerService.get().status() != null) {
             flags.add("during_profiler: a sampling profiler is running — overhead is included");
+        }
+        long sinceGc = MetricsService.msSinceLastGcChange();
+        if (sinceGc <= GC_RECENT_MS) {
+            flags.add(String.format("during_gc: a collection was observed %.1fs ago — this sample may include "
+                    + "its pause (MXBean reports counts, not pause timestamps)", sinceGc / 1000.0));
         }
         return flags;
     }

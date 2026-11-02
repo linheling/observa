@@ -26,7 +26,7 @@
 
 ## 安装
 
-产物：`build/libs/observa-0.1.0.jar`（`gradlew build` 生成）。
+产物：`build/libs/observa-0.3.0.jar`（`gradlew build` 生成）。
 
 - **专用服务器**：放进服务端 `mods/`，客户端不用装。
 - **单机**：放进客户端 `mods/`。集成服务器跑在客户端进程里，所以必须装在客户端侧。
@@ -103,14 +103,15 @@ Invoke-RestMethod -Headers $h http://127.0.0.1:8724/observa/v1/metrics
 | GET | `/health` | ✅ | 存活、uptime、实际端口、`paused`（单机按 ESC 时为 true） |
 | GET | `/metrics?window=1\|10\|60` | ✅ | TPS / MSPT 分位、堆、实体与区块总量、`headline` 一句话诊断、`flags`（含 `stale`/`during_dump`/`during_profiler`） |
 | GET | `/entities?by=type\|dimension\|chunk&top=10` | ✅ | 实体总数、掉落物、经验球、按类型/维度/区块 Top-N |
-| GET | `/memory` | ✅ | 堆与非堆、各内存池、各收集器与上一次 GC 的逐池回收明细、类加载 |
+| GET | `/memory` | ✅ | 堆与非堆、各内存池、各收集器与上一次 GC 的逐池回收明细、类加载；`off_heap`（direct/mapped buffer、code cache、线程栈、NMT 可用时的原生内存六分类）与 `gc_recent`（最近 60 s 的 GC 次数/停顿，附 gc log 里的 MMU 违规、Evacuation Failure、Humongous 计数） |
 | GET | `/system` | ✅ | 进程/整机 CPU、物理内存与 swap、进程 uptime/线程、游戏目录所在卷的磁盘 |
 | GET | `/network?top=10` | ✅ | 每玩家 ping（keep-alive RTT）、收发包数/字节数与每秒速率、总计 |
 | GET | `/heap/histogram` | ✅ | 最近一次堆直方图：存活实例数与估算浅尺寸、按类/按包/**按 mod** 聚合，附 `impact`（这次采集自己造成的 GC 次数与停顿）、类→mod 映射来源与 `recent_histograms`（没有就回 `state:"idle"`；条数在 `/heap/histogram/start` 里用 `top`/`limit` 指定） |
 | POST | `/heap/histogram/start` | ✅ | 异步触发一次 dump+解析：`{"live":true,"keep_file":false,"top":25}`，已有一份在跑（或 retained 正在跑）时回 409；结果保留最近 5 份供差分 |
 | GET | `/heap/histogram/compare?from=&to=&top=20` | ✅ | 两次直方图的差分：哪些类、哪个 mod 在涨（`delta_bytes`）；缺省比最近两份，历史不足或同一次运行回 400 |
-| GET | `/heap/retained` | ✅ | 最近一次支配树分析：每类 **retained size**（独占字节，各类互不重叠）、`dominated_by_class`（谁持有），按 mod 汇总（没有就回 `state:"idle"`） |
-| POST | `/heap/retained/start` | ✅ | 异步触发一次 dump + 引用图 + 支配树：`{"live":true,"max_objects":16000000}`；dump 太大时**预检直接拒绝**（回 `too_large` + `next`，不会先 OOM）；同时只跑一份（已在跑或直方图正在 dump 时回 409），`.hprof` 用完即删 |
+| GET | `/heap/histogram/timeseries?window=30m&limit=20` | ✅ | 每次 dump 记一个点，看 `by_mod` 的**走势**而不是单点：`window` 支持 `30m`/`2h`/`1d` 或纯秒数，回 `series[]`（`points`/`delta_pct`/`growth_bytes_per_min`）与 `totals`；最多保留 720 个点（`window_s`/`samples` 说明实际覆盖） |
+| GET | `/heap/retained` | ✅ | 最近一次支配树分析：每类 **retained size**（独占字节，各类互不重叠）、`dominated_by_class`（谁持有），按 mod 汇总（没有就回 `state:"idle"`）；回 `mode`/`object_limit` |
+| POST | `/heap/retained/start` | ✅ | 异步触发一次 dump + 引用图 + 支配树：`{"live":true,"max_objects":16000000,"mode":"lean"}`；dump 太大时**预检直接拒绝**（回 `too_large` + `next`，不会先 OOM），`mode=lean` 按 96 B/对象算预算（比默认约多 1.6 倍对象，按类精度下降）；同时只跑一份（已在跑或直方图正在 dump 时回 409），`.hprof` 用完即删 |
 | GET | `/heap/dumps` | ✅ | 历次 dump 记录：`dump_ms`/`parse_ms`/`file_bytes` + 瘦身版 `impact`（在内存里，重启清空） |
 | GET | `/heap/alloc-live?heap_id=&jfr_id=&top=20` | ✅ | 把 JFR 分配采样和直方图存活两套口径按类对齐：`alloc_bytes_est` vs `live_bytes`，给 `churn` / `leak_candidate` / `mixed` 判语（`heap=`/`jfr=` 短别名也可用） |
 | POST | `/heap/alloc-live/start?seconds=30` | ✅ | 先 dump 堆、立刻起 JFR，让两侧覆盖同一时间窗；之后轮询 `/heap/alloc-live` |
@@ -521,7 +522,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8724/observa/v1/healt
 
 ```bash
 ./gradlew runServer          # 首次会准备 NeoForm 产物；本机已有缓存，约 10s 起服
-./gradlew build              # 产物 build/libs/observa-0.1.0.jar
+./gradlew build              # 产物 build/libs/observa-0.3.0.jar
 ./gradlew runClientJoin      # 启动客户端并自动连 127.0.0.1:25565（测隧道用）
 ./gradlew runClientSingle    # 启动客户端并直接进 run/saves/pause-test（测 ESC 暂停用）
 ```
@@ -584,9 +585,9 @@ python scripts/rcon.py 'summon minecraft:zombie ~ ~ ~' 'list'
 
 ## 已知边界
 
-- `/heap/histogram` 是**快照**不是时间序列：要看「是不是泄漏」得隔一段时间手动触发两次，再用 `/heap/histogram/compare` 比（内存里保留最近 5 份）
-- `by_mod` 只认 `mods/` 里的 jar：开发环境 `runServer` 的 `mods/` 为空，归因只剩前缀兜底的桶（`minecraft`/`neoforge`/`jdk`/`library`/`unknown`）；要测归因得跑真实整合包
-- `/heap/retained` 是**当前实现的能力上限**：它给 retained size 与 `dominated_by_class`，但**不给引用链**（`A → B → C` 的完整路径），所以「为什么它还没被回收」要靠类名+`dominated_by_class` 推断。支配树按 HPROF 显式 GC root 建（`ROOT_*` 记录 + 类静态字段），不用「入度 0 即根」的近似——后者会把软/弱引用对象算成根、retained 虚高
+- `/heap/histogram` 每次 dump 记一个点，`/heap/histogram/timeseries` 能直接看走势；但它只在**你触发 dump 时**采样（`cadence:"per dump"`），不是后台定时采样——要连续曲线就定时 `POST /heap/histogram/start`（或写个 cron），代价是每次都有一次 dump。
+- `by_mod` 只认 `mods/` 里的 jar：开发环境 `runServer` 的 `mods/` 为空，归因只剩前缀兜底的桶（`minecraft`/`neoforge`/`jdk`/`library`/`unknown`）；要测归因得跑真实整合包。认不出来的包列在 `unknown_packages`，可以在 `config/observa/mapping.json` 里手工归属（`{"packages":{"com.example.foo":"modid"},"classes":{"com.example.Bar":"modid"},"names":{"modid":"显示名"}}`）。
+- `/heap/retained` 最多按「堆的 40% ÷ 160 B」估可建图对象数（`mode=lean` 时 ÷96 B，约多 1.6 倍）；超过就预检拒绝。58 千万对象级别的图在服务器进程内没有安全解法——`lean` 只是把上限按堆放大，不是让任意大的 dump 变可行。
 - `live:true` 的 dump 会在 JVM 里触发一次 full GC 并 STW 约 0.4 秒（350 MB 堆实测）；`keep_file:false` 时 `.hprof` 解析完即删
 - 浅尺寸是估算（引用宽度按 VM 选项折算、8 B 对齐），不是 retained size；`skipped_records` 是非堆记账记录，可忽略
 - 隧道只在你已连接、且权限达标时可用；断线后客户端端点回 503 `no_tunnel`，`.jfr` 原件不通过隧道传

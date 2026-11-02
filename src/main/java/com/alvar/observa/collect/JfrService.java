@@ -311,7 +311,8 @@ public final class JfrService {
         notes.add("summary is aggregated from the .jfr file; raw events stay in the file for 'jfr print'");
         notes.add("allocation weights are JFR-sampled estimates, not exact byte counts");
         notes.add("allocations.confidence / implausible flag low-sample extrapolation (samples near 1 can "
-                + "inflate bytes_est to tens of GB); report(id, minSamples) drops rows with too few samples");
+                + "inflate bytes_est to tens of GB); bytes_est_low/high are ±1/sqrt(samples) sampling error "
+                + "bounds, not physical limits; report(id, minSamples) drops rows with too few samples");
         notes.add("mod_id attributes a class to a mod; site_mod_id attributes the allocating frame — "
                 + "use site_mod_id to catch 'vanilla class allocated by a mod'");
         notes.add("old_objects comes from jdk.OldObjectSample: only objects that survived young GCs are sampled "
@@ -518,6 +519,10 @@ public final class JfrService {
 
         JsonObject alloc = new JsonObject();
         alloc.addProperty("total_bytes_est", allocTotal);
+        // 总量也带误差：报告里 60.6 GB 这种数字光看绝对值没法判断可信度。
+        long[] totalRange = errorRange(allocTotal, allocSamples);
+        alloc.addProperty("total_bytes_est_low", totalRange[0]);
+        alloc.addProperty("total_bytes_est_high", totalRange[1]);
         alloc.addProperty("sample_count", allocSamples);
         // duration_s / mb_per_s：把「30 秒录到 60.6 GB」换算成人能判读的速率（≈2 GB/s）。
         // 单独看总量分不清「一次长录制积累的多」和「速率爆炸」，有速率才好判断可不可能。
@@ -551,6 +556,9 @@ public final class JfrService {
                     row.addProperty("samples", samples);
                     row.addProperty("avg_weight_bytes",
                             samples <= 0 ? 0L : Math.round((double) e.getValue()[0] / samples));
+                    long[] range = errorRange(e.getValue()[0], samples);
+                    row.addProperty("bytes_est_low", range[0]);
+                    row.addProperty("bytes_est_high", range[1]);
                     allocTop.add(row);
                 });
         alloc.add("top", allocTop);
@@ -934,6 +942,23 @@ public final class JfrService {
 
     private static double round2(double v) {
         return Math.round(v * 100.0) / 100.0;
+    }
+
+    /**
+     * 采样外推的误差范围：{@code est * (1 ± 1/sqrt(n))}。
+     *
+     * <p>为什么不给「精确」区间：JFR 只给样本权重之和，没给逐样本明细，算了也不是真置信区间。
+     * 相对标准误差 ≈ {@code 1/√n} 是抽样估计的通用量级——n=1 时区间就是 [0, 2×est]，
+     * 这正好把「1 个样本外推出 60 GB」的荒谬摊开给读的人看；n=100 时收窄到 ±10%。</p>
+     */
+    private static long[] errorRange(long est, long samples) {
+        if (samples <= 0) {
+            return new long[]{est, est};
+        }
+        double relative = 1.0 / Math.sqrt(samples);
+        long low = Math.max(0L, Math.round(est * (1.0 - relative)));
+        long high = Math.round(est * (1.0 + relative));
+        return new long[]{low, high};
     }
 
 }

@@ -51,6 +51,8 @@ public final class HeapService {
     private static final int CLASS_DETAIL_LIMIT = 3000;
     /** .hprof 原件最多留几份（keep_file 时）。 */
     private static final int KEEP_FILES = 3;
+    /** {@code unknown_packages} 最多列多少个包。 */
+    private static final int UNKNOWN_PACKAGE_LIMIT = 20;
     private static final String PATH = "/heap/histogram";
 
     private static final HeapService INSTANCE = new HeapService();
@@ -135,6 +137,9 @@ public final class HeapService {
                     result.top(), result.topPackages(), classes, mods, truncated, impact);
             job = done;
             remember(done);
+            // 时间序列：每次 dump 完成推一条 by_mod 样本（趋势看的是这一串，不是两点 diff）。
+            HeapTimeseries.instance().record(System.currentTimeMillis(), done.totalShallowBytes(),
+                    done.classCount(), done.totalInstances(), done.mods());
             Observa.LOGGER.info("[observa] heap histogram {} done: {} classes, {} instances, {} mods, "
                             + "dump {}ms, parse {}ms, {} GC(s)/{}ms during dump",
                     running.id(), result.classCount(), result.totalInstances(), mods.size(), dumpMs, parseMs,
@@ -299,6 +304,22 @@ public final class HeapService {
             }
             data.add("packages", pkgs);
 
+            // unknown 占大头时，光说「归因失败」没用：告诉用户字节集中在哪些包，他才好写 mapping.json。
+            List<HeapHistogram.PackageEntry> unknownPkgs =
+                    ModIndex.get().unknownPackages(j.packages(), UNKNOWN_PACKAGE_LIMIT);
+            if (!unknownPkgs.isEmpty()) {
+                JsonArray arr = new JsonArray();
+                for (HeapHistogram.PackageEntry e : unknownPkgs) {
+                    JsonObject row = new JsonObject();
+                    row.addProperty("package", e.packageName());
+                    row.addProperty("instances", e.instances());
+                    row.addProperty("shallow_bytes", e.shallowBytes());
+                    row.addProperty("pct", pct(e.shallowBytes(), j.totalShallowBytes()));
+                    arr.add(row);
+                }
+                data.add("unknown_packages", arr);
+            }
+
             JsonArray notes = new JsonArray();
             notes.add("shallow_bytes is an estimate: object header counted as 12/16 bytes, referents not included");
             notes.add("counts are live objects only when the dump was taken with live=true");
@@ -311,6 +332,10 @@ public final class HeapService {
             }
             if (j.impact() != null && j.impact().note() != null) {
                 notes.add(j.impact().note());
+            }
+            if (!unknownPkgs.isEmpty()) {
+                notes.add("unknown_packages lists packages that no jar in mods/ claims; attribute them in "
+                        + "config/observa/mapping.json — {\"packages\":{\"com.example.foo\":\"modid\"}}");
             }
             notes.add("compare two dumps with GET " + PATH + "/compare to see what is growing");
             data.add("notes", notes);

@@ -1,7 +1,9 @@
 package com.alvar.observa.collect;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.IOException;
@@ -11,8 +13,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -83,18 +87,26 @@ public final class ModIndex {
     private static volatile ModIndex instance;
 
     private final Map<String, ModRef> byPackage;
+    /** 外部 mapping.json 的精确类名覆盖：包名规则解释不了的类靠它补。 */
+    private final Map<String, ModRef> byClass;
     private final List<ModRef> mods;
     private final String modsDir;
     private final int classesIndexed;
     private final int packageConflicts;
+    private final String mappingFile;
+    private final int mappingEntries;
 
-    private ModIndex(Map<String, ModRef> byPackage, List<ModRef> mods, String modsDir,
-                     int classesIndexed, int packageConflicts) {
+    private ModIndex(Map<String, ModRef> byPackage, Map<String, ModRef> byClass, List<ModRef> mods,
+                     String modsDir, int classesIndexed, int packageConflicts,
+                     String mappingFile, int mappingEntries) {
         this.byPackage = byPackage;
+        this.byClass = byClass;
         this.mods = mods;
         this.modsDir = modsDir;
         this.classesIndexed = classesIndexed;
         this.packageConflicts = packageConflicts;
+        this.mappingFile = mappingFile;
+        this.mappingEntries = mappingEntries;
     }
 
     public static ModIndex get() {
@@ -120,29 +132,31 @@ public final class ModIndex {
 
     private static ModIndex build() {
         Map<String, ModRef> byPackage = new HashMap<>(1 << 12);
+        Map<String, ModRef> byClass = new HashMap<>(1 << 8);
         List<ModRef> mods = new ArrayList<>();
         String dir = null;
         int classes = 0;
         int conflicts = 0;
+        Mapping mapping = loadMapping();
 
         Path modsDir;
         try {
             modsDir = FMLPaths.GAMEDIR.get().resolve("mods");
             dir = modsDir.toString();
         } catch (Throwable ignored) {
-            // 没有 FML 环境（单测）：只留前缀规则。
-            return new ModIndex(byPackage, mods, null, 0, 0);
+            // 没有 FML 环境（单测）：只留前缀规则（外部 mapping 仍然生效）。
+            return finish(byPackage, byClass, mods, null, 0, 0, mapping);
         }
 
         if (!Files.isDirectory(modsDir)) {
-            return new ModIndex(byPackage, mods, dir, 0, 0);
+            return finish(byPackage, byClass, mods, dir, 0, 0, mapping);
         }
 
         List<Path> jars;
         try (Stream<Path> stream = Files.list(modsDir)) {
             jars = stream.filter(p -> p.getFileName().toString().endsWith(".jar")).sorted().toList();
         } catch (IOException e) {
-            return new ModIndex(byPackage, mods, dir, 0, 0);
+            return finish(byPackage, byClass, mods, dir, 0, 0, mapping);
         }
 
         for (Path jar : jars) {
@@ -178,7 +192,100 @@ public final class ModIndex {
                 mods.add(new ModRef(fallbackId, fallbackId));
             }
         }
-        return new ModIndex(byPackage, mods, dir, classes, conflicts);
+        return finish(byPackage, byClass, mods, dir, classes, conflicts, mapping);
+    }
+
+    // ------------------------------------------------------------------ 外部映射
+
+    /**
+     * {@code config/observa/mapping.json} 的内容。
+     *
+     * <p>为什么需要它：包名规则只能回答「这个类属于哪只 jar」，回答不了
+     * 「这只 jar 其实是某个库的 shade 版本」「这几百个类是我手写的、不在 mods/ 里」。
+     * 报告里 unknown 占到 54% 时，唯一靠谱的出路是让用户把答案写下来。</p>
+     *
+     * <pre>{@code
+     * {
+     *   "names":    {"someid": "Some Mod"},
+     *   "packages": {"com.example.foo": "someid"},
+     *   "classes":  {"com.example.Bar": "someid"}
+     * }
+     * }</pre>
+     *
+     * <p>{@code packages} 吃最长前缀匹配，{@code classes} 精确匹配并优先于包规则。
+     * 文件缺失/写坏都只是「没有覆盖」，不报错——诊断工具不能因为一个可选文件罢工。</p>
+     */
+    private record Mapping(Path file, Map<String, ModRef> byPackage, Map<String, ModRef> byClass) {
+        static final Mapping EMPTY = new Mapping(null, Map.of(), Map.of());
+    }
+
+    private static Mapping loadMapping() {
+        Path path;
+        try {
+            path = FMLPaths.CONFIGDIR.get().resolve("observa").resolve("mapping.json");
+        } catch (Throwable t) {
+            return Mapping.EMPTY;
+        }
+        if (!Files.isRegularFile(path)) {
+            return Mapping.EMPTY;
+        }
+        try {
+            JsonObject root = JsonParser.parseString(Files.readString(path)).getAsJsonObject();
+            Map<String, String> names = new HashMap<>();
+            if (root.has("names") && root.get("names").isJsonObject()) {
+                for (Map.Entry<String, JsonElement> e : root.getAsJsonObject("names").entrySet()) {
+                    names.put(e.getKey(), e.getValue().getAsString());
+                }
+            }
+            Map<String, ModRef> byPackage = new HashMap<>();
+            if (root.has("packages") && root.get("packages").isJsonObject()) {
+                for (Map.Entry<String, JsonElement> e : root.getAsJsonObject("packages").entrySet()) {
+                    String id = e.getValue().getAsString();
+                    byPackage.put(e.getKey(), new ModRef(id, names.getOrDefault(id, id)));
+                }
+            }
+            Map<String, ModRef> byClass = new HashMap<>();
+            if (root.has("classes") && root.get("classes").isJsonObject()) {
+                for (Map.Entry<String, JsonElement> e : root.getAsJsonObject("classes").entrySet()) {
+                    String id = e.getValue().getAsString();
+                    byClass.put(e.getKey(), new ModRef(id, names.getOrDefault(id, id)));
+                }
+            }
+            return new Mapping(path, byPackage, byClass);
+        } catch (Exception e) {
+            // 写坏的映射不阻断诊断：按没有覆盖处理。
+            return new Mapping(path, Map.of(), Map.of());
+        }
+    }
+
+    /** 把外部映射叠到扫描结果上，并把它提到的新 mod 也计入 {@code mods}。 */
+    private static ModIndex finish(Map<String, ModRef> byPackage, Map<String, ModRef> byClass, List<ModRef> mods,
+                                   String dir, int classes, int conflicts, Mapping mapping) {
+        int entries = 0;
+        for (Map.Entry<String, ModRef> e : mapping.byPackage().entrySet()) {
+            byPackage.put(e.getKey(), e.getValue());
+            entries++;
+        }
+        for (Map.Entry<String, ModRef> e : mapping.byClass().entrySet()) {
+            byClass.put(e.getKey(), e.getValue());
+            entries++;
+        }
+        Set<String> known = new HashSet<>();
+        for (ModRef ref : mods) {
+            known.add(ref.modId());
+        }
+        for (ModRef ref : mapping.byPackage().values()) {
+            if (known.add(ref.modId())) {
+                mods.add(ref);
+            }
+        }
+        for (ModRef ref : mapping.byClass().values()) {
+            if (known.add(ref.modId())) {
+                mods.add(ref);
+            }
+        }
+        String file = mapping.file() == null ? null : mapping.file().toString();
+        return new ModIndex(byPackage, byClass, mods, dir, classes, conflicts, file, entries);
     }
 
     /**
@@ -225,14 +332,28 @@ public final class ModIndex {
             return UNKNOWN;
         }
         String name = stripArraySuffix(className);
+        // 精确类名覆盖优先：mapping.json 里写死的答案比包名推断可信。
+        ModRef exact = byClass.get(name);
+        if (exact != null) {
+            return exact;
+        }
         int dot = name.lastIndexOf('.');
         if (dot < 0) {
             return UNKNOWN; // 基本类型 / 默认包
         }
-        String pkg = name.substring(0, dot);
+        return modOfPackage(name.substring(0, dot));
+    }
 
+    /**
+     * 只按包名归因。{@code /heap/histogram} 的 {@code packages} 段是包聚合的，
+     * 拿 {@code modOfClass("a.b.c")} 去问会把包名误当类名（会砍掉最后一段），所以单开一个入口。
+     */
+    public ModRef modOfPackage(String packageName) {
+        if (packageName == null || packageName.isEmpty() || "(default)".equals(packageName)) {
+            return UNKNOWN;
+        }
         // 最长包前缀匹配：a.b.C$D 命中 a.b 也行
-        String candidate = pkg;
+        String candidate = packageName;
         while (true) {
             ModRef ref = byPackage.get(candidate);
             if (ref != null) {
@@ -244,7 +365,30 @@ public final class ModIndex {
             }
             candidate = candidate.substring(0, cut);
         }
-        return byPrefixRule(pkg);
+        return byPrefixRule(packageName);
+    }
+
+    /**
+     * unknown 字节的去向：把包聚合表里归不到任何 mod 的包按字节降序挑出来。
+     *
+     * <p>这就是补 {@code mapping.json} 的输入——报告里 unknown 占 54% 时，
+     * 用户需要的不是一句「归因失败」，而是「这 54% 集中在哪 20 个包」。</p>
+     */
+    public List<HeapHistogram.PackageEntry> unknownPackages(List<HeapHistogram.PackageEntry> packages, int top) {
+        if (packages == null || packages.isEmpty()) {
+            return List.of();
+        }
+        List<HeapHistogram.PackageEntry> out = new ArrayList<>();
+        for (HeapHistogram.PackageEntry p : packages) {
+            if (modOfPackage(p.packageName()) == UNKNOWN) {
+                out.add(p);
+            }
+        }
+        out.sort((a, b) -> Long.compare(b.shallowBytes(), a.shallowBytes()));
+        if (top > 0 && out.size() > top) {
+            return List.copyOf(out.subList(0, top));
+        }
+        return List.copyOf(out);
     }
 
     /** 环境自带的归属：原版 / NeoForge / JDK / 第三方库。 */
@@ -311,6 +455,9 @@ public final class ModIndex {
         data.addProperty("mods_indexed", mods.size());
         data.addProperty("packages_indexed", byPackage.size());
         data.addProperty("classes_indexed", classesIndexed);
+        data.addProperty("mapping_file", mappingFile);
+        data.addProperty("mapping_entries", mappingEntries);
+        data.addProperty("class_overrides", byClass.size());
         if (packageConflicts > 0) {
             data.addProperty("package_conflicts", packageConflicts);
         }

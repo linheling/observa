@@ -321,7 +321,7 @@ M3 / M4 追加证据（同一台机器）：
 
 ## 12. 交付物
 
-- `build/libs/observa-0.1.0.jar`
+- `build/libs/observa-0.3.0.jar`
 - `README.md`：安装、配置项全表、端点全表、单机/服务器差异
 - `docs/DIAGNOSIS.md` 诊断 SOP：症状 → 先调哪个端点 → 看哪个字段 → 下一步深挖，附 curl / PowerShell 示例
 - 示例：`docs/examples/*.json`（真实输出样本，供我后续对照 schema）
@@ -344,3 +344,24 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8724/observa/v1/snaps
 | 实体堆积 | `/entities?top=20` | 单类型异常占比或掉落物破万 |
 | 网络问题 | `/network` | 单玩家发送队列/超时异常 |
 | 崩溃前状态 | `/blackbox` + `/logs?level=WARN` | 最近一份黑匣子的 `errors` / `log_tail` 对照时间线 |
+
+---
+
+## 14. 0.3.0 相对 0.1.0 的变更
+
+依据 `D:\C\MC\error_analysis\observa\observa-api-gaps.md` 的 11 条使用体验缺口，0.3.0 补齐如下：
+
+| 缺口 | 落地 |
+|---|---|
+| #1 retained 只有硬上限、没有渐进路径 | 预检在第一趟数对象时就中止（不再先分配数组再 OOM），回 `too_large{objects,exact,required_bytes}` + `next[]`；`max_objects` 放宽受 `HARD_MAX_OBJECTS=32M` 与「堆的 40%」双重约束；新增 `mode=lean`（96 B/对象预算，约 1.6 倍对象数，按类精度下降） |
+| #2 直方图没有时间序列 | `HeapTimeseries`（720 点环形缓冲，每次 dump 记一点）+ `GET /heap/histogram/timeseries?window=30m`：`series[]`/`delta_pct`/`growth_bytes_per_min` |
+| #3 采集代价不可见 | `GcImpact`：每次 dump 前后取 GC MXBean + 堆用量，回 `impact{pause_ms,gc_collections,full_gc_triggered,heap_used_delta_bytes}`；`GET /heap/dumps` 给历次记录 |
+| #4 分配与存活口径对不齐 | `AllocLive.join(heapId,jfrId,top)` + `GET /heap/alloc-live`；`POST /heap/alloc-live/start` 先起 JFR 再 dump（实测 `skew_ms≈457, overlaps=true`） |
+| #5 低采样外推没有误差范围 | `bytes_est_low/high`（±1/√samples）、`confidence`、`implausible`、`report(id,minSamples)` 过滤 |
+| #6 mod 归因停在包前缀、unknown 54% | `config/observa/mapping.json`（packages/classes/names 三层覆盖）、`mod_mapping` 统计、`unknown_packages` 明细 |
+| #7 GC 只有累计值 | `GcWatch`：60 s 窗口增量 + gc log 解析（MMU 违规、Evacuation Failure、To-space exhausted、Humongous） |
+| #8 堆外说不清 | `OffHeap`：direct/mapped buffer、code cache、metaspace、线程栈估算、NMT（`-XX:NativeMemoryTracking=summary`）六分类 + `other_bytes` |
+| #9 没有启动参数体检 | `GET /jvm/flags`：10 条 check（缺 `-Xms`/`MaxMetaspaceSize`、dump/log 路径、`-Xmx` 超物理内存 75% 等），每条带可粘贴 `fix` |
+| #10 没有一次性导出 | `GET /session/export?include=...`（11 段，含别名 `histogram→heap`，未知段 400 并列出合法值） |
+| #11 量纲/单位/flag 不一致 | `window`/`since_seconds`/`since` 统一走 `parseDurationSeconds`（`30m`/`2h`/纯秒）；`flags` 增 `stale`/`during_dump`/`during_profiler`/`during_gc`；`manifest.response_schema` 给机器可读的响应形状 |
+| 顺手 | `?limit=` 与 `?top=` 互认 |

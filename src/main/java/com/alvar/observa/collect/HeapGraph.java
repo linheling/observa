@@ -82,6 +82,14 @@ public final class HeapGraph {
 
     /** 每对象预算（下标/尺寸/计数/映射/支配树数组加起来的经验值）。 */
     private static final int BYTES_PER_OBJECT_BUDGET = 160;
+    /**
+     * {@code mode=lean} 时按每对象多少字节算预算。
+     *
+     * <p>lean 只保留「对象类型 / 浅尺寸 / 可达数据」三样最省的数组，代价是不再给出精确支配树，
+     * 只给按类聚合的 retained 下界。它存在的意义不是让 5800 万对象变得可行，而是让
+     * 「比默认上限大、但仍在堆的 40% 以内」的 dump 有两个台阶可走，而不是一刀切拒绝。</p>
+     */
+    public static final int LEAN_BYTES_PER_OBJECT = 96;
     /** 分析最多肯占堆的比例：堆分析器自己变成内存压力源是最糟糕的失败方式。 */
     private static final double HEAP_SHARE = 0.4;
 
@@ -102,8 +110,20 @@ public final class HeapGraph {
      * 那种请求应该在预检阶段被拒绝，而不是在分析到一半时把服务器拖死。</p>
      */
     public static int effectiveObjectLimit(int maxObjectsOverride) {
-        long byHeap = (long) (Runtime.getRuntime().maxMemory() * HEAP_SHARE / BYTES_PER_OBJECT_BUDGET);
-        int cap = MAX_OBJECTS;
+        return effectiveObjectLimit(maxObjectsOverride, BYTES_PER_OBJECT_BUDGET);
+    }
+
+    /**
+     * 带每对象预算的版本：{@code mode=lean} 用 {@link #LEAN_BYTES_PER_OBJECT}，默认用 160。
+     *
+     * <p>预算越小，允许的对象数越多，但对真实占用越没留余量——lean 的 96 B 是「不再建支配树」之后
+     * 还能站得住的值，别拿它去试更小。</p>
+     */
+    public static int effectiveObjectLimit(int maxObjectsOverride, int bytesPerObjectBudget) {
+        int budget = bytesPerObjectBudget > 0 ? bytesPerObjectBudget : BYTES_PER_OBJECT_BUDGET;
+        long byHeap = (long) (Runtime.getRuntime().maxMemory() * HEAP_SHARE / budget);
+        // lean 模式本来就是为了多装对象，静态上限也跟着抬到硬顶；40% 堆约束仍然优先。
+        int cap = budget < BYTES_PER_OBJECT_BUDGET ? HARD_MAX_OBJECTS : MAX_OBJECTS;
         if (maxObjectsOverride > 0) {
             cap = Math.min(HARD_MAX_OBJECTS, maxObjectsOverride);
         }
@@ -115,6 +135,11 @@ public final class HeapGraph {
         return BYTES_PER_OBJECT_BUDGET;
     }
 
+    /** lean 模式每对象预算（给预检报告 / {@code object_limit} 的 mode 说明用）。 */
+    public static int leanBytesPerObject() {
+        return LEAN_BYTES_PER_OBJECT;
+    }
+
     /**
      * dump 太大、连图都建不起来时抛这个：带上「数到了多少 / 上限多少 / 大概要多少堆 / 该怎么改」，
      * 让调用方直接拼进 HTTP 错误体的 {@code next}，而不是只写一行日志。
@@ -123,16 +148,26 @@ public final class HeapGraph {
         private final long objects;
         private final int limit;
         private final boolean exact;
+        private final int bytesPerObject;
 
         public TooLargeException(long objects, int limit, boolean exact) {
+            this(objects, limit, exact, BYTES_PER_OBJECT_BUDGET);
+        }
+
+        /**
+         * @param bytesPerObject 这次分析用的是哪种预算（160 = full，96 = lean），
+         *                       报错文案和 {@link #requiredBytes()} 都要跟着变，否则 lean 模式会给出错误的堆估算
+         */
+        public TooLargeException(long objects, int limit, boolean exact, int bytesPerObject) {
             super((exact ? "dump 里有 " + objects + " 个对象"
                     : "已数到 " + objects + " 个对象（提前中止，未继续统计，实际只多不少）")
                     + "，超过 retained 分析上限 " + limit
                     + "（可用堆 " + Runtime.getRuntime().maxMemory() / (1024 * 1024) + " MB，每对象约 "
-                    + BYTES_PER_OBJECT_BUDGET + " B）");
+                    + bytesPerObject + " B）");
             this.objects = objects;
             this.limit = limit;
             this.exact = exact;
+            this.bytesPerObject = bytesPerObject;
         }
 
         public long objects() {
@@ -149,7 +184,7 @@ public final class HeapGraph {
 
         /** 按当前上限估算这次分析需要多少堆（字节）。 */
         public long requiredBytes() {
-            return objects * BYTES_PER_OBJECT_BUDGET;
+            return objects * bytesPerObject;
         }
     }
 
@@ -202,7 +237,7 @@ public final class HeapGraph {
      * @param hprof dump 文件（调用方负责它的生命周期）
      */
     public static Result analyze(Path hprof) throws IOException {
-        return analyze(hprof, 0);
+        return analyze(hprof, 0, false);
     }
 
     /**
@@ -210,11 +245,24 @@ public final class HeapGraph {
      * @throws TooLargeException 第一趟数对象时就超限，此时还没有建图、没有分配大数组
      */
     public static Result analyze(Path hprof, int maxObjects) throws IOException {
-        int limit = effectiveObjectLimit(maxObjects);
-        Layout layout = Layout.read(hprof, limit);
+        return analyze(hprof, maxObjects, false);
+    }
+
+    /**
+     * 带 lean 开关的版本：{@code lean=true} 按每对象 96 B 而不是 160 B 算预算，
+     * 允许的图更大约 1.6 倍，代价是按类聚合的 retained 精度下降（见 {@link #LEAN_BYTES_PER_OBJECT}）。
+     *
+     * @param maxObjects 调用方显式放宽的对象数上限；0 = 用默认
+     * @param lean        是否使用 lean 预算
+     * @throws TooLargeException 第一趟数对象时就超限，此时还没有建图、没有分配大数组
+     */
+    public static Result analyze(Path hprof, int maxObjects, boolean lean) throws IOException {
+        int budget = lean ? LEAN_BYTES_PER_OBJECT : BYTES_PER_OBJECT_BUDGET;
+        int limit = effectiveObjectLimit(maxObjects, budget);
+        Layout layout = Layout.read(hprof, limit, budget);
         if (layout.objectCount() > limit) {
             // 只有 limit<=0（不检查）时才可能走到这里
-            throw new TooLargeException(layout.objectCount(), limit, true);
+            throw new TooLargeException(layout.objectCount(), limit, true, budget);
         }
         Graph graph = Graph.read(hprof, layout);
         return graph.analyze(layout);
@@ -339,18 +387,25 @@ public final class HeapGraph {
         private int objectCount;
         /** 第一趟就盯着上限：超了立刻中止，绝不先分配几十 MB 数组再拒绝。0 = 不检查。 */
         private int objectLimit;
+        /** 这次分析用的每对象预算（160 = full，96 = lean），只用于把准确的数字塞进预检报错。 */
+        private int bytesPerObjectBudget = BYTES_PER_OBJECT_BUDGET;
 
         Layout() {
             Arrays.fill(primitiveSlots, -1);
         }
 
         static Layout read(Path hprof) throws IOException {
-            return read(hprof, 0);
+            return read(hprof, 0, BYTES_PER_OBJECT_BUDGET);
         }
 
         static Layout read(Path hprof, int objectLimit) throws IOException {
+            return read(hprof, objectLimit, BYTES_PER_OBJECT_BUDGET);
+        }
+
+        static Layout read(Path hprof, int objectLimit, int bytesPerObjectBudget) throws IOException {
             Layout layout = new Layout();
             layout.objectLimit = objectLimit;
+            layout.bytesPerObjectBudget = bytesPerObjectBudget;
             try (HeapHistogram.HprofReader reader = open(hprof)) {
                 layout.idSize = reader.idSize();
                 while (true) {
@@ -394,7 +449,7 @@ public final class HeapGraph {
         private void countObject() {
             objectCount++;
             if (objectLimit > 0 && objectCount > objectLimit) {
-                throw new TooLargeException(objectCount, objectLimit, false);
+                throw new TooLargeException(objectCount, objectLimit, false, bytesPerObjectBudget);
             }
         }
 

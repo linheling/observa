@@ -55,7 +55,7 @@ public final class RetainedService {
                       long fileBytes, String error, long objects, long edges, int classes, int roots,
                       long layoutMismatches, long unreachable, long unreachableBytes, long shallowBytes,
                       long dumpShallowBytes, long droppedEdges, List<HeapGraph.ClassRow> classRows,
-                      String crossCheck, int maxObjects, Limit limit, GcImpact impact) {
+                      String crossCheck, int maxObjects, boolean lean, Limit limit, GcImpact impact) {
     }
 
     /**
@@ -104,15 +104,25 @@ public final class RetainedService {
      *                   仍受「可用堆的 40%」约束，超了会在预检阶段被拒绝而不是 OOM
      */
     public synchronized boolean start(boolean live, boolean crossCheck, int maxObjects) {
+        return start(live, crossCheck, maxObjects, false);
+    }
+
+    /**
+     * 带 lean 开关的启动版本。
+     *
+     * @param lean {@code true} 时按每对象 96 B 而不是 160 B 算预算（允许的图大约 1.6 倍），
+     *             代价是按类聚合的 retained 精度下降，见 {@link HeapGraph#LEAN_BYTES_PER_OBJECT}
+     */
+    public synchronized boolean start(boolean live, boolean crossCheck, int maxObjects, boolean lean) {
         Job current = job;
         if (current != null && "running".equals(current.state())) {
             return false;
         }
         String id = "retained-" + seq.incrementAndGet();
         Job running = new Job(id, "running", System.currentTimeMillis(), 0, 0, 0, 0, null,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, List.of(), null, maxObjects, null, null);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, List.of(), null, maxObjects, lean, null, null);
         job = running;
-        worker.submit(() -> run(running, live, crossCheck, maxObjects));
+        worker.submit(() -> run(running, live, crossCheck, maxObjects, lean));
         return true;
     }
 
@@ -121,7 +131,7 @@ public final class RetainedService {
         return current != null && "running".equals(current.state());
     }
 
-    private void run(Job running, boolean live, boolean crossCheck, int maxObjects) {
+    private void run(Job running, boolean live, boolean crossCheck, int maxObjects, boolean lean) {
         Path dir = dir();
         Path hprof = dir.resolve(running.id() + ".hprof");
         long dumpMs = 0;
@@ -139,7 +149,7 @@ public final class RetainedService {
             impact = GcImpact.measure(dumpMs, before, GcImpact.snapshot());
             bytes = Files.exists(hprof) ? Files.size(hprof) : 0;
             long t1 = System.nanoTime();
-            HeapGraph.Result result = HeapGraph.analyze(hprof, maxObjects);
+            HeapGraph.Result result = HeapGraph.analyze(hprof, maxObjects, lean);
             analyzeMs = (System.nanoTime() - t1) / 1_000_000L;
             parseMs = 0; // 三趟都在 analyze 里，dump_ms/analyze_ms 已经把时间分干净了
             String crossCheckNote = crossCheck ? crossCheck(hprof, result) : null;
@@ -147,7 +157,7 @@ public final class RetainedService {
                     bytes, null, result.objects(), result.edges(), result.classes(), result.roots(),
                     result.layoutMismatches(), result.unreachable(), result.unreachableBytes(),
                     result.shallowBytes(), result.dumpShallowBytes(), result.droppedEdges(),
-                    result.classRows(), crossCheckNote, maxObjects, null, impact);
+                    result.classRows(), crossCheckNote, maxObjects, lean, null, impact);
             job = done;
             Observa.LOGGER.info("[observa] retained {} done: {} objects, {} edges, {} classes, {} roots, "
                             + "retained {} bytes of {} dump bytes, layout_mismatches {}, dropped_edges {}, "
@@ -167,7 +177,7 @@ public final class RetainedService {
                     tooLarge.exact());
             Job failed = new Job(running.id(), "failed", running.startedAtMs(), dumpMs, parseMs, analyzeMs,
                     bytes, tooLarge.getMessage(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, List.of(), null,
-                    maxObjects, limit, impact);
+                    maxObjects, lean, limit, impact);
             job = failed;
             Observa.LOGGER.warn("[observa] retained {} rejected by preflight: {} (needs ~{} MB, limit {} objects)",
                     running.id(), tooLarge.getMessage(), tooLarge.requiredBytes() / (1024 * 1024),
@@ -175,7 +185,7 @@ public final class RetainedService {
         } catch (Throwable t) {
             Job failed = new Job(running.id(), "failed", running.startedAtMs(), dumpMs, parseMs, analyzeMs,
                     bytes, String.valueOf(t), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, List.of(), null,
-                    maxObjects, null, impact);
+                    maxObjects, lean, null, impact);
             job = failed;
             Observa.LOGGER.warn("[observa] retained {} failed", running.id(), t);
         } finally {
@@ -230,7 +240,9 @@ public final class RetainedService {
         if (j.maxObjects() > 0) {
             data.addProperty("max_objects", j.maxObjects());
         }
-        data.addProperty("object_limit", HeapGraph.effectiveObjectLimit(j.maxObjects()));
+        data.addProperty("mode", j.lean() ? "lean" : "full");
+        data.addProperty("object_limit", HeapGraph.effectiveObjectLimit(j.maxObjects(),
+                j.lean() ? HeapGraph.leanBytesPerObject() : HeapGraph.bytesPerObject()));
         data.add("impact", j.impact() == null ? GcImpact.unavailable() : j.impact().json());
         if (j.limit() != null) {
             Limit limit = j.limit();
@@ -244,6 +256,10 @@ public final class RetainedService {
             JsonArray next = new JsonArray();
             next.add("GET " + HISTOGRAM_PATH
                     + " returns live objects per class without building the object graph");
+            if (!j.lean()) {
+                next.add("retry with mode=lean: it budgets 96 instead of 160 bytes per object, so the same "
+                        + "heap holds about 1.6x more objects (retained precision per class drops)");
+            }
             next.add("or raise -Xmx: the graph needs at least " + (limit.requiredBytes() / (1024 * 1024))
                     + " MB of free heap for what has been counted so far (" + limit.objects()
                     + " objects" + (limit.exact() ? "" : ", a lower bound") + "), then retry; "
@@ -361,9 +377,12 @@ public final class RetainedService {
         if (j.impact() != null && j.impact().note() != null) {
             notes.add(j.impact().note());
         }
-        notes.add("this analysis builds the whole object graph: about " + HeapGraph.effectiveObjectLimit(j.maxObjects()) / 1000
+        notes.add("this analysis builds the whole object graph: about "
+                + HeapGraph.effectiveObjectLimit(j.maxObjects(),
+                        j.lean() ? HeapGraph.leanBytesPerObject() : HeapGraph.bytesPerObject()) / 1000
                 + "k objects of headroom on this JVM (" + Runtime.getRuntime().maxMemory() / (1024 * 1024)
-                + " MB heap) and one JVM pause for the dump; raise -Xmx if a run reports 'heap graph too large'");
+                + " MB heap) and one JVM pause for the dump; add ?mode=lean for ~1.6x headroom at lower "
+                + "per-class precision, or raise -Xmx if a run reports 'heap graph too large'");
         data.add("notes", notes);
         return data;
     }
